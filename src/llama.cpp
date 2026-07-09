@@ -416,6 +416,78 @@ struct llama_model * llama_model_init_from_user(
     params.use_extra_bufts = false;
     return llama_model_load_from_file_impl(metadata, set_tensor_data, set_tensor_data_ud, path_model, splits, /*file*/ nullptr, params);
 }
+struct llama_model_buffer_load_state {
+    const uint8_t * data;
+    size_t size;
+    struct gguf_context * metadata;
+    bool check_tensors;
+};
+
+static void llama_model_set_tensor_data_from_buffer(struct ggml_tensor * tensor, void * userdata) {
+    const auto * state = static_cast<const llama_model_buffer_load_state *>(userdata);
+    GGML_ASSERT(state != nullptr);
+    GGML_ASSERT(state->data != nullptr);
+    GGML_ASSERT(state->metadata != nullptr);
+
+    const int64_t tensor_idx = gguf_find_tensor(state->metadata, ggml_get_name(tensor));
+    if (tensor_idx < 0) {
+        throw std::runtime_error(format("tensor '%s' not found in the model", ggml_get_name(tensor)));
+    }
+
+    const size_t offset = gguf_get_data_offset(state->metadata) + gguf_get_tensor_offset(state->metadata, tensor_idx);
+    const size_t nbytes = ggml_nbytes(tensor);
+    if (offset > state->size || nbytes > state->size - offset) {
+        throw std::runtime_error(format("tensor '%s' data is not within the supplied buffer", ggml_get_name(tensor)));
+    }
+
+    const uint8_t * source = state->data + offset;
+    if (state->check_tensors && !ggml_validate_row_data(tensor->type, source, nbytes)) {
+        throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(tensor)));
+    }
+
+    if (tensor->buffer != nullptr) {
+        ggml_backend_tensor_set(tensor, source, 0, nbytes);
+        return;
+    }
+
+    if (tensor->data == nullptr) {
+        throw std::runtime_error(format("tensor '%s' has no destination storage", ggml_get_name(tensor)));
+    }
+
+    memcpy(tensor->data, source, nbytes);
+}
+
+struct llama_model * llama_model_load_from_buffer(
+        const void * data,
+        size_t size,
+        struct llama_model_params params) {
+    if (data == nullptr || size == 0) {
+        LLAMA_LOG_ERROR("%s: buffer is empty\n", __func__);
+        return nullptr;
+    }
+
+    struct gguf_init_params gguf_params = {
+        /*.no_alloc =*/ true,
+        /*.ctx      =*/ nullptr,
+    };
+
+    struct gguf_context * metadata = gguf_init_from_buffer(data, size, gguf_params);
+    if (metadata == nullptr) {
+        LLAMA_LOG_ERROR("%s: failed to parse GGUF metadata from buffer\n", __func__);
+        return nullptr;
+    }
+
+    llama_model_buffer_load_state state = {
+        /*.data          =*/ static_cast<const uint8_t *>(data),
+        /*.size          =*/ size,
+        /*.metadata      =*/ metadata,
+        /*.check_tensors =*/ params.check_tensors,
+    };
+
+    struct llama_model * model = llama_model_init_from_user(metadata, llama_model_set_tensor_data_from_buffer, &state, params);
+    gguf_free(metadata);
+    return model;
+}
 // deprecated
 struct llama_model * llama_load_model_from_file(
         const char * path_model,

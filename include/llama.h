@@ -499,6 +499,13 @@ extern "C" {
                                    FILE * file,
               struct llama_model_params   params);
 
+    // Load a model from an application-owned GGUF byte range.
+    // The caller must keep the buffer alive until loading completes.
+    LLAMA_API struct llama_model * llama_model_load_from_buffer(
+                             const void * data,
+                                  size_t   size,
+              struct llama_model_params   params);
+
     // Load a model from multiple splits (support custom naming scheme)
     // The paths must be in the correct order
     LLAMA_API struct llama_model * llama_model_load_from_splits(
