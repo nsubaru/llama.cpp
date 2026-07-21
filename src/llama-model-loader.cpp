@@ -527,8 +527,11 @@ llama_model_loader::llama_model_loader(
         bool check_tensors,
         bool no_alloc,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
-        : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+        const uint8_t * borrowed_buffer_data,
+        size_t borrowed_buffer_size)
+        : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud),
+          borrowed_buffer_data(borrowed_buffer_data), borrowed_buffer_size(borrowed_buffer_size) {
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
         trace = atoi(getenv("LLAMA_TRACE"));
@@ -1450,6 +1453,43 @@ bool llama_model_loader::load_all_data(
         llama_mlocks * lmlocks,
         llama_progress_callback progress_callback,
         void * progress_callback_user_data) {
+    if (borrowed_buffer_data != nullptr) {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const int64_t tensor_idx = gguf_find_tensor(metadata, ggml_get_name(t));
+            if (tensor_idx < 0) {
+                throw std::runtime_error(format("tensor '%s' not found in the model", ggml_get_name(t)));
+            }
+
+            const size_t offset = gguf_get_data_offset(metadata) + gguf_get_tensor_offset(metadata, tensor_idx);
+            const size_t nbytes = ggml_nbytes(t);
+            if (offset > borrowed_buffer_size || nbytes > borrowed_buffer_size - offset) {
+                throw std::runtime_error(format("tensor '%s' data is not within the borrowed buffer", ggml_get_name(t)));
+            }
+
+            uint8_t * source = const_cast<uint8_t *>(borrowed_buffer_data + offset);
+            if (check_tensors && !ggml_validate_row_data(t->type, source, nbytes)) {
+                throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(t)));
+            }
+
+            ggml_backend_buffer_t view_buffer = bufs.count(0) ? bufs.at(0) : nullptr;
+            if (view_buffer != nullptr && t->data == nullptr) {
+                if (ggml_backend_tensor_alloc(view_buffer, t, source) != GGML_STATUS_SUCCESS) {
+                    throw std::runtime_error(format("failed to bind tensor '%s' to the borrowed buffer", ggml_get_name(t)));
+                }
+            } else if (t->data != nullptr) {
+                ggml_backend_tensor_set(t, source, 0, nbytes);
+            } else {
+                throw std::runtime_error(format("tensor '%s' has no destination storage", ggml_get_name(t)));
+            }
+
+            size_done += nbytes;
+            if (progress_callback && !progress_callback((float) size_done / size_data, progress_callback_user_data)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     if (files.empty()) {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             set_tensor_data(t, set_tensor_data_ud);

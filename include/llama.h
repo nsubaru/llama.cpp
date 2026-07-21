@@ -499,9 +499,17 @@ extern "C" {
                                    FILE * file,
               struct llama_model_params   params);
 
-    // Load a model from an application-owned GGUF byte range.
+    // Load a model from an application-owned GGUF byte range by copying tensor data.
     // The caller must keep the buffer alive until loading completes.
     LLAMA_API struct llama_model * llama_model_load_from_buffer(
+                             const void * data,
+                                  size_t   size,
+              struct llama_model_params   params);
+
+    // Load a model from an application-owned GGUF byte range without copying CPU tensor data.
+    // Offloaded tensors are copied to their target backend. The caller must keep the buffer
+    // address and contents valid until the returned model is freed.
+    LLAMA_API struct llama_model * llama_model_load_from_buffer_view(
                              const void * data,
                                   size_t   size,
               struct llama_model_params   params);

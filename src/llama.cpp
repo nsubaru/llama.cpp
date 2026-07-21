@@ -277,10 +277,12 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
 
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
-        const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
+        const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params,
+        const uint8_t * borrowed_buffer_data, size_t borrowed_buffer_size) {
     try {
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.use_mmap, params.use_direct_io,
-            params.check_tensors, params.no_alloc, params.kv_overrides, params.tensor_buft_overrides);
+            params.check_tensors, params.no_alloc, params.kv_overrides, params.tensor_buft_overrides,
+            borrowed_buffer_data, borrowed_buffer_size);
 
         ml.print_info();
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
@@ -345,7 +347,9 @@ static struct llama_model * llama_model_load_from_file_impl(
         const std::string & path_model,
         std::vector<std::string> & splits,
         FILE * file,
-        struct llama_model_params params) {
+        struct llama_model_params params,
+        const uint8_t * borrowed_buffer_data = nullptr,
+        size_t borrowed_buffer_size = 0) {
     {
         int n_sources_defined = 0;
         if (metadata != nullptr) {
@@ -386,7 +390,9 @@ static struct llama_model * llama_model_load_from_file_impl(
         };
     }
 
-    const auto [status, model] = llama_model_load(metadata, set_tensor_data, set_tensor_data_ud, path_model, splits, file, params);
+    const auto [status, model] = llama_model_load(
+        metadata, set_tensor_data, set_tensor_data_ud, path_model, splits, file, params,
+        borrowed_buffer_data, borrowed_buffer_size);
     GGML_ASSERT(status <= 0);
     if (status < 0) {
         if (status == -1) {
@@ -485,6 +491,44 @@ struct llama_model * llama_model_load_from_buffer(
     };
 
     struct llama_model * model = llama_model_init_from_user(metadata, llama_model_set_tensor_data_from_buffer, &state, params);
+    gguf_free(metadata);
+    return model;
+}
+
+struct llama_model * llama_model_load_from_buffer_view(
+        const void * data,
+        size_t size,
+        struct llama_model_params params) {
+    if (data == nullptr || size == 0) {
+        LLAMA_LOG_ERROR("%s: buffer is empty\n", __func__);
+        return nullptr;
+    }
+
+    struct gguf_init_params gguf_params = {
+        /*.no_alloc =*/ true,
+        /*.ctx      =*/ nullptr,
+    };
+
+    struct gguf_context * metadata = gguf_init_from_buffer(data, size, gguf_params);
+    if (metadata == nullptr) {
+        LLAMA_LOG_ERROR("%s: failed to parse GGUF metadata from buffer\n", __func__);
+        return nullptr;
+    }
+
+    std::string path_model;
+    std::vector<std::string> splits;
+    params.use_mmap = false;
+    params.use_extra_bufts = false;
+    struct llama_model * model = llama_model_load_from_file_impl(
+        metadata,
+        nullptr,
+        nullptr,
+        path_model,
+        splits,
+        /*file*/ nullptr,
+        params,
+        static_cast<const uint8_t *>(data),
+        size);
     gguf_free(metadata);
     return model;
 }
