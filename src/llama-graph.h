@@ -811,9 +811,15 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // -1 builds the complete reference; 0..n_layer build one training layer or the output head.
+    int32_t training_layer = -1;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
+        if (training_layer != other.training_layer) {
+            return false;
+        }
         // first check the ubatch
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
@@ -937,6 +943,8 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_training_input = nullptr;
+    ggml_tensor * t_training_output = nullptr;
 
     std::vector<ggml_tensor *> t_layer_inp;
 

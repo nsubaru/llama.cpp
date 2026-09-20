@@ -2218,6 +2218,108 @@ static std::pair<int, int> test_qwen_training() {
         check(llama_adapter_training_compute(training, tokens, labels, &loss, nullptr, nullptr) && loss == first_loss, "repeat starts with fresh recurrent state");
         float guard = 123.0f;
         check(llama_adapter_training_gradient(training, first->name, &guard, 1) == gradient.size() && guard == 123.0f, "undersized gradient destination untouched");
+        auto * recomputed = llama_adapter_training_init_checkpointed(model, adapter, config, nullptr, error, sizeof(error));
+        check(recomputed != nullptr, "preflight layer recomputation");
+        if (!recomputed) fprintf(stderr, "recomputation: %s\n", error);
+        auto equivalent = [&](llama_adapter_training * candidate) {
+            float candidate_loss = NAN;
+            bool ok = candidate && llama_adapter_training_compute(candidate, tokens, labels, &candidate_loss, nullptr, nullptr);
+            if (candidate && !ok) fprintf(stderr, "recomputed compute: %s\n", llama_adapter_training_error(candidate));
+            ok &= fabsf(candidate_loss-first_loss) < 2e-6f;
+            for (const auto & entry : adapter->ab_map) for (auto * p : {entry.second.a, entry.second.b}) {
+                std::vector<float> reference(ggml_nelements(p)), actual(reference.size());
+                ok &= llama_adapter_training_gradient(training, p->name, reference.data(), reference.size()) == reference.size();
+                ok &= llama_adapter_training_gradient(candidate, p->name, actual.data(), actual.size()) == actual.size();
+                for (size_t i = 0; i < reference.size(); ++i) ok &= fabsf(reference[i]-actual[i]) < 2e-5f;
+            }
+            return ok;
+        };
+        check(equivalent(recomputed), "recomputed loss and every adapter gradient match full graph");
+        const size_t recomputed_workspace = llama_adapter_training_workspace_size(recomputed);
+        fprintf(stdout, "Qwen %s charged workspace: full=%zu recomputed=%zu bytes\n", mixed ? "mixed" : "F32", workspace, recomputed_workspace);
+        check(recomputed_workspace > 0 && recomputed_workspace < workspace, "recomputation reduces charged workspace");
+        check(llama_adapter_training_checkpoint_size(training) == 0 &&
+            llama_adapter_training_checkpoint_size(recomputed) == 2*embd*4*sizeof(float), "preflight reports layer-boundary payload capacity");
+        auto constrained = config;
+        constrained.workspace_budget_bytes = recomputed_workspace;
+        rejected = llama_adapter_training_init(model, adapter, constrained, error, sizeof(error));
+        check(!rejected && strstr(error, "budget"), "full graph rejected under recomputation budget");
+        llama_adapter_training_free(rejected);
+        auto * bounded = llama_adapter_training_init_checkpointed(model, adapter, constrained, nullptr, error, sizeof(error));
+        check(equivalent(bounded), "complete sequence fits recomputation budget");
+        llama_adapter_training_free(bounded);
+        struct boundary_store {
+            std::map<uint32_t, FILE *> files;
+            size_t written = 0, read = 0;
+            bool fail_write = false, fail_read = false, fail_clear = false;
+        } store;
+        llama_adapter_checkpoint_store disk = {&store,
+            [](void * data, uint32_t boundary, const void * bytes, size_t size) {
+                auto & s = *(boundary_store *) data;
+                if (s.fail_write) return false;
+                FILE * file = tmpfile();
+                if (!file) return false;
+                s.files.emplace(boundary, file);
+                const bool ok = fwrite(bytes, 1, size, file) == size && fflush(file) == 0;
+                if (ok) s.written += size;
+                return ok;
+            },
+            [](void * data, uint32_t boundary, void * bytes, size_t size) {
+                auto & s = *(boundary_store *) data;
+                const auto found = s.files.find(boundary);
+                if (s.fail_read || found == s.files.end() || fseek(found->second, 0, SEEK_SET) != 0) return false;
+                const bool ok = fread(bytes, 1, size, found->second) == size;
+                if (ok) s.read += size;
+                return ok;
+            },
+            [](void * data) {
+                auto & s = *(boundary_store *) data;
+                const bool had_files = !s.files.empty();
+                for (const auto & file : s.files) fclose(file.second);
+                s.files.clear();
+                return !s.fail_clear || !had_files;
+            }};
+        auto * spilled = llama_adapter_training_init_checkpointed(model, adapter, config, &disk, error, sizeof(error));
+        check(equivalent(spilled) && store.written == 2*embd*4*sizeof(float) && store.read == store.written && store.files.empty(),
+            "disk boundaries reproduce gradients and are cleaned up");
+        check(llama_adapter_training_workspace_size(spilled) + 2*embd*4*sizeof(float) == recomputed_workspace,
+            "external boundaries excluded from charged RAM");
+        store.fail_write = true;
+        check(!llama_adapter_training_compute(spilled, tokens, labels, &loss, nullptr, nullptr) && store.files.empty() &&
+            llama_adapter_training_gradient(spilled, first->name, nullptr, 0) == 0, "checkpoint write failure invalidates gradients");
+        store.fail_write = false;
+        store.fail_read = true;
+        check(!llama_adapter_training_compute(spilled, tokens, labels, &loss, nullptr, nullptr) && store.files.empty() &&
+            llama_adapter_training_gradient(spilled, first->name, nullptr, 0) == 0, "checkpoint read failure cleans partial run");
+        store.fail_read = false;
+        check(!llama_adapter_training_compute(spilled, tokens, labels, &loss, [](void * data) {
+            return !((boundary_store *) data)->files.empty();
+        }, &store) && store.files.empty(), "cancellation releases written layer checkpoints");
+        store.fail_clear = true;
+        check(!llama_adapter_training_compute(spilled, tokens, labels, &loss, nullptr, nullptr) && store.files.empty() &&
+            llama_adapter_training_gradient(spilled, first->name, nullptr, 0) == 0, "post-compute cleanup failure invalidates gradients");
+        store.fail_clear = false;
+        check(equivalent(spilled), "fresh checkpointed run recovers after failed attempts");
+        llama_adapter_training_free(spilled);
+        llama_adapter_training_free(recomputed);
+        const char * late_target = "blk.2.attn_output.weight";
+        auto * late_adapter = llama_adapter_lora_init_training(model, &late_target, 1, 2, 4, 1);
+        auto * late_full = llama_adapter_training_init(model, late_adapter, config, error, sizeof(error));
+        auto * late_recomputed = llama_adapter_training_init_checkpointed(model, late_adapter, config, nullptr, error, sizeof(error));
+        float late_loss = NAN, late_recomputed_loss = NAN;
+        bool late_ok = late_adapter && late_full && late_recomputed &&
+            llama_adapter_training_compute(late_full, tokens, labels, &late_loss, nullptr, nullptr) &&
+            llama_adapter_training_compute(late_recomputed, tokens, labels, &late_recomputed_loss, nullptr, nullptr) && late_loss == late_recomputed_loss;
+        if (late_adapter) for (auto * p : {late_adapter->ab_map.at(late_target).a, late_adapter->ab_map.at(late_target).b}) {
+            std::vector<float> a(ggml_nelements(p)), b(a.size());
+            late_ok &= llama_adapter_training_gradient(late_full, p->name, a.data(), a.size()) == a.size();
+            late_ok &= llama_adapter_training_gradient(late_recomputed, p->name, b.data(), b.size()) == b.size();
+            for (size_t i = 0; i < a.size(); ++i) late_ok &= fabsf(a[i]-b[i]) < 2e-5f;
+        }
+        check(late_ok, "recompute handles entirely frozen prefix layers");
+        llama_adapter_training_free(late_full);
+        llama_adapter_training_free(late_recomputed);
+        llama_adapter_lora_free(late_adapter);
         const char * binding = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         auto settings = llama_adapter_optimizer_default_params();
         settings.gradient_clip = 0.1f;

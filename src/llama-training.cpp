@@ -11,6 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <set>
 #include <stdexcept>
 
 struct llama_adapter_training {
@@ -24,6 +25,10 @@ struct llama_adapter_training {
     ggml_backend_buffer_ptr buffer;
     ggml_tensor * labels = nullptr;
     ggml_tensor * loss = nullptr;
+    ggml_tensor * upstream_tensor = nullptr;
+    ggml_tensor * input_gradient = nullptr;
+    ggml_cgraph * forward = nullptr;
+    ggml_context_ptr forward_context;
     ggml_cplan plan = {};
     std::vector<uint8_t> scratch;
     std::vector<llama_token> tokens;
@@ -36,7 +41,17 @@ struct llama_adapter_training {
     uint64_t supervised = 0;
     uint64_t revision = 0;
     std::string error;
+    bool checkpointed = false;
+    llama_adapter_checkpoint_store store = {};
+    ggml_context_ptr gradient_context;
+    std::map<std::string, std::vector<float>> gradient_values;
+    std::vector<float> boundary, upstream;
+    std::vector<std::vector<float>> boundaries;
+    size_t retained_workspace = 0;
 };
+
+static float compute_checkpointed(llama_adapter_training * t, const llama_token * tokens, const llama_token * labels,
+        ggml_abort_callback abort_callback, void * abort_data);
 
 static size_t checked_add(size_t a, size_t b) {
     if (b > SIZE_MAX - a) throw std::runtime_error("training workspace size overflow");
@@ -93,13 +108,14 @@ static void validate_training_model(llama_model * model, llama_adapter_lora * ad
     }
 }
 
-llama_adapter_training * llama_adapter_training_init(llama_model * model, llama_adapter_lora * adapter,
-        llama_adapter_training_params params, char * error, size_t error_capacity) {
+static llama_adapter_training * training_init_graph(llama_model * model, llama_adapter_lora * adapter,
+        llama_adapter_training_params params, int layer, char * error, size_t error_capacity, bool allocate = true) {
     if (error && error_capacity) error[0] = '\0';
     try {
         validate_training_model(model, adapter, params);
-        const size_t max_nodes = 2048 + 4096*model->hparams.n_layer() + 8*adapter->ab_map.size();
-        const size_t metadata = max_nodes*ggml_tensor_overhead() + ggml_graph_overhead_custom(max_nodes, true);
+        const size_t max_nodes = 2048 + 4096*(layer < 0 ? model->hparams.n_layer() : 1) + 8*adapter->ab_map.size();
+        const size_t metadata = max_nodes*ggml_tensor_overhead() + ggml_graph_overhead_custom(max_nodes, true) +
+            (layer >= 0 ? ggml_graph_overhead_custom(max_nodes, false) : 0);
         if (metadata > params.workspace_budget_bytes) throw std::runtime_error("training graph metadata exceeds workspace budget");
         std::unique_ptr<llama_adapter_training> t(new llama_adapter_training());
         t->model = model;
@@ -116,6 +132,7 @@ llama_adapter_training * llama_adapter_training_init(llama_model * model, llama_
         p.arch = model->arch;
         p.hparams = model->hparams;
         p.gtype = LLM_GRAPH_TYPE_ADAPTER_TRAINING;
+        p.training_layer = layer;
         p.backend_cpu = t->cpu.get();
         p.cvec = &t->cvec;
         p.loras = &t->loras;
@@ -139,15 +156,33 @@ llama_adapter_training * llama_adapter_training_init(llama_model * model, llama_
         c.yarn_beta_slow = p.hparams.yarn_beta_slow;
         auto * graph = model->build_graph(p);
         auto * ctx = t->result->get_ctx();
-        t->labels = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, params.n_tokens);
-        t->loss = ggml_cross_entropy_loss_sparse(ctx, t->result->get_logits(), t->labels);
+        if (layer >= 0 && layer < (int) model->hparams.n_layer()) {
+            auto * output = t->result->t_training_output;
+            t->upstream_tensor = ggml_dup_tensor(ctx, output);
+            t->loss = ggml_sum(ctx, ggml_mul(ctx, output, t->upstream_tensor));
+            t->forward_context.reset(ggml_init({ggml_graph_overhead_custom(max_nodes, false), nullptr, true}));
+            if (!t->forward_context) throw std::runtime_error("cannot allocate forward graph metadata");
+            t->forward = ggml_new_graph_custom(t->forward_context.get(), max_nodes, false);
+            ggml_build_forward_expand(t->forward, output);
+        } else {
+            t->labels = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, params.n_tokens);
+            t->loss = ggml_cross_entropy_loss_sparse(ctx, t->result->get_logits(), t->labels);
+        }
         ggml_set_loss(t->loss);
         ggml_build_forward_expand(graph, t->loss);
-        ggml_build_backward_expand(ctx, graph, nullptr);
+        bool has_parameters = false;
+        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) has_parameters |= (ggml_graph_node(graph, i)->flags & GGML_TENSOR_FLAG_PARAM) != 0;
+        // The first layer can be entirely frozen. No derivative before its embedding lookup is required.
+        if (has_parameters) ggml_build_backward_expand(ctx, graph, nullptr);
         for (const auto & entry : adapter->ab_map) for (auto * parameter : {entry.second.a, entry.second.b}) {
             auto * gradient = ggml_graph_get_grad(graph, parameter);
+            if (!gradient && layer >= 0) continue;
             if (!gradient || gradient->type != GGML_TYPE_F32 || !ggml_is_contiguous(gradient)) throw std::runtime_error("adapter target requires a connected contiguous F32 gradient");
             t->gradients.emplace(parameter->name, gradient);
+        }
+        if (t->result->t_training_input) {
+            t->input_gradient = ggml_graph_get_grad(graph, t->result->t_training_input);
+            if (!t->input_gradient || !ggml_is_contiguous(t->input_gradient)) throw std::runtime_error("missing contiguous layer input derivative");
         }
         for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
             if (!ggml_backend_supports_op(t->cpu.get(), ggml_graph_node(graph, i))) {
@@ -161,7 +196,8 @@ llama_adapter_training * llama_adapter_training_init(llama_model * model, llama_
         const size_t block = (size_t) ceil(sqrt((double) params.n_tokens));
         const size_t slots = (params.n_tokens + block - 1)/block + block + 3;
         t->workspace = checked_add(t->workspace, slots*model->hparams.ssm_d_state*model->hparams.ssm_d_state*sizeof(float));
-        if (t->workspace > params.workspace_budget_bytes) throw std::runtime_error("full-sequence training workspace exceeds budget; layer recomputation is required");
+        if (t->workspace > params.workspace_budget_bytes) throw std::runtime_error("training graph workspace exceeds budget");
+        if (!allocate) return t.release();
         t->buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type()));
         if (!t->buffer) throw std::runtime_error("cannot allocate CPU training workspace");
         ggml_backend_buffer_clear(t->buffer.get(), 0);
@@ -174,9 +210,143 @@ llama_adapter_training * llama_adapter_training_init(llama_model * model, llama_
     }
 }
 
+llama_adapter_training * llama_adapter_training_init(llama_model * model, llama_adapter_lora * adapter,
+        llama_adapter_training_params params, char * error, size_t error_capacity) {
+    return training_init_graph(model, adapter, params, -1, error, error_capacity);
+}
+
+llama_adapter_training * llama_adapter_training_init_checkpointed(llama_model * model, llama_adapter_lora * adapter,
+        llama_adapter_training_params params, const llama_adapter_checkpoint_store * store, char * error, size_t error_capacity) {
+    if (error && error_capacity) error[0] = '\0';
+    try {
+        validate_training_model(model, adapter, params);
+        if (store && (!store->write || !store->read || !store->clear)) throw std::runtime_error("checkpoint store requires write, read and clear callbacks");
+        const size_t elements = (size_t) model->tok_embd->ne[0]*params.n_tokens;
+        if (elements > SIZE_MAX/sizeof(float)/(model->hparams.n_layer()+2)) throw std::runtime_error("layer boundary size overflow");
+        const size_t boundary_bytes = elements*sizeof(float);
+        const size_t gradient_metadata = 2*adapter->ab_map.size()*ggml_tensor_overhead();
+        size_t retained = checked_add(gradient_metadata, boundary_bytes*2);
+        if (!store) retained = checked_add(retained, boundary_bytes*(model->hparams.n_layer()-1));
+        for (const auto & entry : adapter->ab_map) for (auto * p : {entry.second.a, entry.second.b}) retained = checked_add(retained, ggml_nbytes(p));
+        if (retained >= params.workspace_budget_bytes) throw std::runtime_error("layer boundaries and adapter gradients exceed workspace budget");
+        auto stage_params = params;
+        stage_params.workspace_budget_bytes -= retained;
+        size_t peak = 0;
+        std::set<std::string> connected;
+        for (uint32_t layer = 0; layer <= model->hparams.n_layer(); ++layer) {
+            char reason[256];
+            std::unique_ptr<llama_adapter_training> stage(training_init_graph(model, adapter, stage_params, layer, reason, sizeof(reason), false));
+            if (!stage) throw std::runtime_error(std::string("layer preflight: ")+reason);
+            peak = std::max(peak, stage->workspace);
+            for (const auto & entry : stage->gradients) {
+                if (!connected.insert(entry.first).second) throw std::runtime_error("adapter parameter is shared across training stages");
+            }
+        }
+        if (connected.size() != adapter->ab_map.size()*2) throw std::runtime_error("adapter target is not connected to checkpointed training loss");
+        std::unique_ptr<llama_adapter_training> t(new llama_adapter_training());
+        t->model = model; t->adapter = adapter; t->config = params; t->checkpointed = true;
+        t->retained_workspace = retained; t->workspace = checked_add(retained, peak);
+        if (store) t->store = *store;
+        t->boundary.resize(elements); t->upstream.resize(elements);
+        if (!store) {
+            t->boundaries.resize(model->hparams.n_layer()-1);
+            for (auto & boundary : t->boundaries) boundary.resize(elements);
+        }
+        t->gradient_context.reset(ggml_init({gradient_metadata, nullptr, true}));
+        if (!t->gradient_context) throw std::runtime_error("cannot allocate adapter gradient metadata");
+        for (const auto & entry : adapter->ab_map) for (auto * p : {entry.second.a, entry.second.b}) {
+            auto & values = t->gradient_values[p->name];
+            values.resize(ggml_nelements(p));
+            auto * gradient = ggml_dup_tensor(t->gradient_context.get(), p);
+            gradient->data = values.data();
+            t->gradients.emplace(p->name, gradient);
+        }
+        return t.release();
+    } catch (const std::exception & e) {
+        if (error && error_capacity) snprintf(error, error_capacity, "%s", e.what());
+        return nullptr;
+    }
+}
+
+static float compute_checkpointed(llama_adapter_training * t, const llama_token * tokens, const llama_token * labels,
+        ggml_abort_callback abort_callback, void * abort_data) {
+    const size_t bytes = t->boundary.size()*sizeof(float);
+    const uint32_t layers = t->model->hparams.n_layer();
+    auto stage_params = t->config;
+    stage_params.workspace_budget_bytes -= t->retained_workspace;
+    auto cancelled = [&]() { if (abort_callback && abort_callback(abort_data)) throw std::runtime_error("training compute cancelled"); };
+    auto read = [&](uint32_t boundary) {
+        if (t->store.read) {
+            if (!t->store.read(t->store.user_data, boundary, t->boundary.data(), bytes)) throw std::runtime_error("activation checkpoint read failed");
+        } else {
+            memcpy(t->boundary.data(), t->boundaries.at(boundary-1).data(), bytes);
+        }
+        for (float value : t->boundary) if (!std::isfinite(value)) throw std::runtime_error("nonfinite activation checkpoint");
+    };
+    auto build = [&](uint32_t layer) {
+        cancelled();
+        char reason[256];
+        std::unique_ptr<llama_adapter_training> stage(training_init_graph(t->model, t->adapter, stage_params, layer, reason, sizeof(reason)));
+        if (!stage) throw std::runtime_error(std::string("layer execution: ")+reason);
+        std::copy(tokens, tokens+t->config.n_tokens, stage->tokens.begin());
+        stage->result->set_inputs(&stage->graph_params.ubatch);
+        if (layer > 0) ggml_backend_tensor_set(stage->result->t_training_input, t->boundary.data(), 0, bytes);
+        stage->plan.abort_callback = abort_callback;
+        stage->plan.abort_callback_data = abort_data;
+        return stage;
+    };
+    auto execute = [&](llama_adapter_training * stage, bool backward) {
+        cancelled();
+        ggml_graph_reset(stage->result->get_gf());
+        const auto status = ggml_graph_compute(backward ? stage->result->get_gf() : stage->forward, &stage->plan);
+        if (status != GGML_STATUS_SUCCESS) throw std::runtime_error(status == GGML_STATUS_ABORTED ? "training compute cancelled" : "training layer compute failed");
+    };
+    auto copy_gradients = [&](llama_adapter_training * stage) {
+        if (stage->input_gradient) ggml_backend_tensor_get(stage->input_gradient, t->upstream.data(), 0, bytes);
+        for (const auto & entry : stage->gradients) {
+            auto * destination = t->gradients.at(entry.first);
+            ggml_backend_tensor_get(entry.second, destination->data, 0, ggml_nbytes(destination));
+        }
+    };
+    for (uint32_t layer = 0; layer < layers; ++layer) {
+        auto stage = build(layer);
+        execute(stage.get(), false);
+        ggml_backend_tensor_get(stage->result->t_training_output, t->boundary.data(), 0, bytes);
+        for (float value : t->boundary) if (!std::isfinite(value)) throw std::runtime_error("nonfinite layer boundary");
+        if (layer+1 < layers) {
+            if (t->store.write) {
+                if (!t->store.write(t->store.user_data, layer+1, t->boundary.data(), bytes)) throw std::runtime_error("activation checkpoint write failed");
+            } else {
+                memcpy(t->boundaries[layer].data(), t->boundary.data(), bytes);
+            }
+        }
+    }
+    float loss;
+    {
+        auto head = build(layers);
+        ggml_backend_tensor_set(head->labels, labels, 0, t->config.n_tokens*sizeof(llama_token));
+        execute(head.get(), true);
+        loss = *(float *) head->loss->data;
+        copy_gradients(head.get());
+    }
+    for (int layer = (int) layers-1; layer >= 0; --layer) {
+        cancelled();
+        if (layer > 0) read(layer);
+        auto stage = build(layer);
+        ggml_backend_tensor_set(stage->upstream_tensor, t->upstream.data(), 0, bytes);
+        execute(stage.get(), true);
+        copy_gradients(stage.get());
+    }
+    return loss;
+}
+
 void llama_adapter_training_free(llama_adapter_training * training) { delete training; }
 
 size_t llama_adapter_training_workspace_size(const llama_adapter_training * training) { return training ? training->workspace : 0; }
+
+size_t llama_adapter_training_checkpoint_size(const llama_adapter_training * training) {
+    return training && training->checkpointed ? training->boundary.size()*sizeof(float)*(training->model->hparams.n_layer()-1) : 0;
+}
 
 bool llama_adapter_training_compute(llama_adapter_training * t, const llama_token * tokens, const llama_token * labels,
         float * loss, ggml_abort_callback abort_callback, void * abort_data) {
@@ -185,6 +355,7 @@ bool llama_adapter_training_compute(llama_adapter_training * t, const llama_toke
     t->consumed = false;
     t->error.clear();
     try {
+        if (t->store.clear && !t->store.clear(t->store.user_data)) throw std::runtime_error("activation checkpoint cleanup failed");
         if (!tokens || !labels || !loss) throw std::runtime_error("missing training input or loss destination");
         const int64_t vocab = t->model->tok_embd->ne[1];
         size_t supervised = 0;
@@ -194,20 +365,26 @@ bool llama_adapter_training_compute(llama_adapter_training * t, const llama_toke
         }
         if (!supervised) throw std::runtime_error("training sequence has no supervised tokens");
         if (abort_callback && abort_callback(abort_data)) throw std::runtime_error("training compute cancelled");
-        std::copy(tokens, tokens + t->config.n_tokens, t->tokens.begin());
-        t->result->set_inputs(&t->graph_params.ubatch);
-        ggml_backend_tensor_set(t->labels, labels, 0, t->config.n_tokens*sizeof(llama_token));
-        ggml_graph_reset(t->result->get_gf());
-        t->plan.abort_callback = abort_callback;
-        t->plan.abort_callback_data = abort_data;
-        const auto status = ggml_graph_compute(t->result->get_gf(), &t->plan);
-        if (status != GGML_STATUS_SUCCESS) throw std::runtime_error(status == GGML_STATUS_ABORTED ? "training compute cancelled" : "training graph compute failed");
-        const float value = *(const float *) t->loss->data;
+        float value;
+        if (t->checkpointed) {
+            value = compute_checkpointed(t, tokens, labels, abort_callback, abort_data);
+        } else {
+            std::copy(tokens, tokens + t->config.n_tokens, t->tokens.begin());
+            t->result->set_inputs(&t->graph_params.ubatch);
+            ggml_backend_tensor_set(t->labels, labels, 0, t->config.n_tokens*sizeof(llama_token));
+            ggml_graph_reset(t->result->get_gf());
+            t->plan.abort_callback = abort_callback;
+            t->plan.abort_callback_data = abort_data;
+            const auto status = ggml_graph_compute(t->result->get_gf(), &t->plan);
+            if (status != GGML_STATUS_SUCCESS) throw std::runtime_error(status == GGML_STATUS_ABORTED ? "training compute cancelled" : "training graph compute failed");
+            value = *(const float *) t->loss->data;
+        }
         if (!std::isfinite(value)) throw std::runtime_error("nonfinite training loss");
         for (const auto & entry : t->gradients) {
             const float * values = (const float *) entry.second->data;
             for (int64_t i = 0; i < ggml_nelements(entry.second); ++i) if (!std::isfinite(values[i])) throw std::runtime_error("nonfinite adapter gradient");
         }
+        if (t->store.clear && !t->store.clear(t->store.user_data)) throw std::runtime_error("activation checkpoint cleanup failed");
         *loss = value;
         t->supervised = supervised;
         t->revision = t->adapter->training_revision;
@@ -215,6 +392,7 @@ bool llama_adapter_training_compute(llama_adapter_training * t, const llama_toke
         return true;
     } catch (const std::exception & e) {
         t->error = e.what();
+        if (t->store.clear && !t->store.clear(t->store.user_data)) t->error += "; activation checkpoint cleanup failed";
         return false;
     }
 }

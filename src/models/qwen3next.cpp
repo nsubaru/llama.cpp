@@ -140,17 +140,27 @@ llama_model_qwen3next::graph::graph(const llama_model & model, const llm_graph_p
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
-    inpL = build_inp_embd(model.tok_embd);
+    const bool training = params.gtype == LLM_GRAPH_TYPE_ADAPTER_TRAINING;
+    const bool segmented = training && params.training_layer >= 0;
+    const int first_layer = segmented ? params.training_layer : 0;
+    const int last_layer = segmented ? std::min(first_layer + 1, (int) n_layer) : (int) n_layer;
+    if (segmented && first_layer > 0) {
+        inpL = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_param(inpL);
+        ggml_set_name(inpL, "training.layer_input");
+        res->t_training_input = inpL;
+    } else {
+        inpL = build_inp_embd(model.tok_embd);
+    }
     cb(inpL, "model.embed_tokens", -1);
 
-    const bool training = params.gtype == LLM_GRAPH_TYPE_ADAPTER_TRAINING;
     auto * inp = training ? nullptr : build_inp_mem_hybrid();
 
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = training ? nullptr : build_inp_out_ids();
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = first_layer; il < last_layer; ++il) {
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
@@ -200,6 +210,12 @@ llama_model_qwen3next::graph::graph(const llama_model & model, const llm_graph_p
         inpL = cur;
     }
     cur = inpL;
+
+    if (segmented && first_layer < n_layer) {
+        res->t_training_output = cur;
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
 
     // post-norm hidden state is input to both the LM head and the MTP head
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);

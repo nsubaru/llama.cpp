@@ -9,15 +9,16 @@ extern "C" {
     struct llama_adapter_training;
     struct llama_adapter_optimizer;
 
-    // Experimental CPU reference for one complete causal Qwen3Next sequence.
-    // All intermediate activations are retained; layer recomputation and external activation spill are not provided here.
+    // Experimental CPU training for one complete causal Qwen3Next sequence.
+    // Use the checkpointed initializer for layer recomputation and optional external activation storage.
     struct llama_adapter_training_params {
         uint32_t n_tokens;             // Fixed sequence length; no truncation or padding is performed.
         int32_t n_threads;             // Positive CPU worker count.
         size_t workspace_budget_bytes; // Graph metadata, tensor buffers and compute scratch; excludes borrowed model/adapter and C++ container overhead.
     };
 
-    // Create an isolated forward/backward graph with zero initial recurrent state and no inference caches.
+    // Create a full reference forward/backward graph, retaining all intermediate activations.
+    // Uses zero initial recurrent state and no inference caches.
     // Supports CPU-accessible frozen weights and an F32 adapter from llama_adapter_lora_init_training.
     // The model and adapter must outlive the returned context. No other context may use or modify the adapter concurrently.
     // Returns NULL on unsupported configuration or insufficient workspace; error is optional and always terminated when capacity > 0.
@@ -27,10 +28,34 @@ extern "C" {
             struct llama_adapter_training_params params,
             char * error, size_t error_capacity);
 
+    // Caller-owned temporary storage for F32 layer boundaries, numbered 1..n_layer-1.
+    // Callbacks run synchronously, must preserve exact bytes, and return false on failure without throwing.
+    // clear removes only this context's temporary artifacts; it runs before and after each compute, including failures.
+    // Storage capacity, integrity checks, staging memory and I/O cancellation are the caller's responsibility.
+    struct llama_adapter_checkpoint_store {
+        void * user_data;
+        bool (*write)(void * user_data, uint32_t boundary, const void * data, size_t size);
+        bool (*read)(void * user_data, uint32_t boundary, void * data, size_t size);
+        bool (*clear)(void * user_data);
+    };
+
+    // Recompute one complete layer at a time during backward; no sequence or attention context is shortened.
+    // A null store retains only layer boundaries in RAM and charges them to the workspace budget.
+    // An external store permits disk-backed boundaries; its memory and disk budgets are outside this API's workspace count.
+    // Preflight checks every layer/head workspace. Model/adapter/callback lifetimes and exclusive access remain caller-owned.
+    LLAMA_API struct llama_adapter_training * llama_adapter_training_init_checkpointed(
+            struct llama_model * model, struct llama_adapter_lora * adapter,
+            struct llama_adapter_training_params params, const struct llama_adapter_checkpoint_store * store,
+            char * error, size_t error_capacity);
+
     LLAMA_API void llama_adapter_training_free(struct llama_adapter_training * training);
 
     // Charged workspace bytes. This is not resident memory or process commit; mapped base pages are excluded.
     LLAMA_API size_t llama_adapter_training_workspace_size(const struct llama_adapter_training * training);
+
+    // Maximum layer-boundary payload bytes, in RAM or the external store; zero for the full reference.
+    // External store metadata, alignment and atomic-write space must be reserved separately by the caller.
+    LLAMA_API size_t llama_adapter_training_checkpoint_size(const struct llama_adapter_training * training);
 
     // Compute mean assistant-token loss and fresh adapter gradients without changing any weights.
     // Both arrays have n_tokens elements. labels[i] is the target predicted after tokens[i]; -1 masks that position.
