@@ -736,7 +736,34 @@ extern "C" {
     // Load a LoRA adapter from an open FILE pointer, reading from its current position
     LLAMA_API struct llama_adapter_lora * llama_adapter_lora_init_from_file_ptr(
             struct llama_model * model,
-            FILE * file);
+                          FILE * file);
+
+    // Load an adapter from a borrowed GGUF buffer. The buffer is needed only during this call.
+    // Rejects unsupported tensors, invalid dimensions, and non-finite adapter weights.
+    LLAMA_API struct llama_adapter_lora * llama_adapter_lora_init_from_buffer(
+            struct llama_model * model,
+                    const void * data,
+                        size_t   size);
+
+    // Initialize CPU F32 LoRA parameters for explicitly named 2D projection weights.
+    // A uses deterministic uniform initialization; B is zero, so the initial adapter is neutral.
+    // Only adapter tensors are marked trainable. The model must outlive the adapter.
+    // This initializes parameters; it does not construct a model training graph.
+    LLAMA_API struct llama_adapter_lora * llama_adapter_lora_init_training(
+            struct llama_model * model,
+             const char * const * targets,
+                         size_t   n_targets,
+                       uint32_t   rank,
+                          float   alpha,
+                       uint64_t   seed);
+
+    // Export an adapter as F16 GGUF into caller-owned storage. Returns the required size,
+    // or zero on error. A null or undersized buffer is not written. Does not include optimizer state.
+    // All contexts using this adapter must be idle while parameters are read or changed.
+    LLAMA_API size_t llama_adapter_lora_export_buffer(
+            const struct llama_adapter_lora * adapter,
+                                       void * data,
+                                     size_t   capacity);
 
     // Functions to access the adapter's GGUF metadata scalar values
     // - The functions return the length of the string on success, or -1 on failure

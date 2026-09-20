@@ -1179,6 +1179,11 @@ struct test_case {
         return 1e-4;
     }
 
+    virtual double gradient_error(const std::vector<float> & numeric, const std::vector<float> & analytic,
+                                  const std::vector<float> & expected) {
+        return mean_abs_asymm(numeric.data(), analytic.data(), numeric.size(), expected);
+    }
+
     virtual double max_err() {
         return max_nmse_err();
     }
@@ -1938,8 +1943,9 @@ struct test_case {
                 ggml_backend_tensor_set(t, x0.data(), 0, ggml_nbytes(t));
             }
 
-            const double err = mean_abs_asymm(gn.data(), ga.data(), gn.size(), expect);
+            const double err = gradient_error(gn, ga, expect);
             if (err > max_maa_err()) {
+                fprintf(stderr, "gradient mismatch for %s: numerical[0]=%.9g analytic[0]=%.9g\n", t->name, gn[0], ga[0]);
                 test_operation_info info(op_desc(out), vars(), ggml_backend_name(backend));
                 info.set_maa_error(err, max_maa_err());
                 output_printer->print_operation(info);
@@ -2039,7 +2045,7 @@ struct test_unary : public test_case {
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const bool grad_supported = op == GGML_UNARY_OP_ABS || op == GGML_UNARY_OP_SGN || op == GGML_UNARY_OP_NEG ||
             op == GGML_UNARY_OP_STEP || op == GGML_UNARY_OP_RELU || op == GGML_UNARY_OP_SILU ||
-            op == GGML_UNARY_OP_EXPM1 || op == GGML_UNARY_OP_SOFTPLUS;
+            op == GGML_UNARY_OP_EXPM1 || op == GGML_UNARY_OP_SOFTPLUS || op == GGML_UNARY_OP_SIGMOID;
 
         ggml_tensor * a;
         if (v & 1) {
@@ -4356,6 +4362,8 @@ struct test_ssm_conv : public test_case {
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a   = ggml_new_tensor(ctx, type, 4, ne_a.data());
         ggml_tensor * b   = ggml_new_tensor(ctx, type, 4, ne_b.data());
+        ggml_set_param(a);
+        ggml_set_param(b);
         ggml_tensor * out = ggml_ssm_conv(ctx, a, b);
         return out;
     }
@@ -4633,6 +4641,20 @@ struct test_rwkv_wkv6 : public test_case {
 
 // GGML_OP_GATED_DELTA_NET
 struct test_gated_delta_net : public test_case {
+    bool grad_precise() override { return true; }
+    float grad_eps() override { return 0.02f; }
+
+    double gradient_error(const std::vector<float> & numeric, const std::vector<float> & analytic,
+                          const std::vector<float> &) override {
+        // Decayed-state gradients approach zero. Use a maximum absolute/relative error, not division by a vanishing derivative.
+        double worst = 0.0;
+        for (size_t i = 0; i < numeric.size(); ++i) {
+            if (!std::isfinite(numeric[i]) || !std::isfinite(analytic[i])) return std::numeric_limits<double>::infinity();
+            worst = std::max(worst, (double) fabsf(numeric[i] - analytic[i]) / (1.0 + fabsf(numeric[i]) + fabsf(analytic[i])));
+        }
+        return worst;
+    }
+
     const ggml_type type;
 
     const int64_t head_count;
@@ -4678,6 +4700,9 @@ struct test_gated_delta_net : public test_case {
         ggml_set_name(g,     "g");
         ggml_set_name(beta,  "beta");
         ggml_set_name(state, "state");
+        if (head_size <= 8) {
+            for (auto * parameter : {q, k, v, g, beta, state}) ggml_set_param(parameter->view_src ? parameter->view_src : parameter);
+        }
         // q/k are L2-normalised in qwen35/kimi-linear before delta_net
         q = ggml_l2_norm(ctx, q, 1e-6f);
         k = ggml_l2_norm(ctx, k, 1e-6f);
@@ -4686,8 +4711,22 @@ struct test_gated_delta_net : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 random(20260920);
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (ggml_is_view_op(t->op)) { continue; }
+            if (head_size <= 8 && (t->flags & GGML_TENSOR_FLAG_PARAM)) {
+                // Keep normalized input vectors away from zero for stable finite differences.
+                std::vector<float> values(ggml_nelements(t));
+                for (float & value : values) {
+                    const float unit = (random() >> 8) / 16777216.0f;
+                    if (strcmp(t->name, "g") == 0) value = -3.0f + 2.95f*unit;
+                    else if (strcmp(t->name, "beta") == 0) value = 0.1f + 0.8f*unit;
+                    else value = (unit < 0.5f ? -1.0f : 1.0f)*(0.4f + 0.4f*unit);
+                }
+                if (strcmp(t->name, "g") == 0) values[0] = -20.0f;
+                ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(float));
+                continue;
+            }
             if (strcmp(t->name, "g") == 0) {
                 init_tensor_uniform(t, -20.0f, -1e-4f);
             } else if (strcmp(t->name, "beta") == 0) {
@@ -5096,6 +5135,11 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, float amax =
 
 // GGML_OP_MUL_MAT_ID
 struct test_mul_mat_id : public test_case {
+    float grad_eps() override {
+        // The function is linear in the input; a larger difference reduces F32 loss cancellation.
+        return 1.0f;
+    }
+
     const ggml_type type_a;
     const ggml_type type_b;
     const int n_mats;
@@ -5150,6 +5194,9 @@ struct test_mul_mat_id : public test_case {
 
         ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, this->b ? 1 : n_used, n);
         ggml_set_name(b, "b");
+        if (type_a == GGML_TYPE_F32 && type_b == GGML_TYPE_F32) {
+            ggml_set_param(b);
+        }
 
         ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
         ggml_set_name(out, "out");
@@ -9855,6 +9902,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 1700000,  3, 2592, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 1700000,  1, 2592, {1, 1}, {1, 1}));
 
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F32, GGML_TYPE_F32, 4, 2, false, 3, 4, 8));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F32, GGML_TYPE_F32, 4, 2, true, 3, 4, 8));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 2, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 1, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
@@ -10950,6 +10999,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
 
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 2, 4, 3, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 2, 4, 5, 1, 2, false, false, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 1, 4, 5, 1, 2, true, true, 2));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));

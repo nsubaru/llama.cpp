@@ -73,6 +73,7 @@ struct llama_adapter_lora {
 
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
+    gguf_context_ptr export_metadata;
 
     // activated lora (aLoRA)
     std::vector<llama_token> alora_invocation_tokens;

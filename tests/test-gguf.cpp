@@ -1,5 +1,7 @@
 #include "ggml.h"
 #include "llama.h"
+#include "../src/llama-adapter.h"
+#include "../src/llama-model.h"
 #include "ggml-cpu.h"
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -1571,6 +1573,18 @@ static std::pair<int, int> test_expert_parts() {
         ggml_build_forward_expand(graph, output);
         check(ggml_graph_compute_with_ctx(ctx, graph, 2) == GGML_STATUS_SUCCESS, "selected expert compute");
         check(static_cast<float *>(output->data)[0] == static_cast<float>(width), "selected expert result");
+        ggml_set_param(input);
+        auto * loss = ggml_sum(ctx, output);
+        ggml_set_loss(loss);
+        auto * backward = ggml_new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE, true);
+        ggml_build_forward_expand(backward, loss);
+        ggml_build_backward_expand(ctx, backward, nullptr);
+        ggml_graph_reset(backward);
+        check(ggml_graph_compute_with_ctx(ctx, backward, 2) == GGML_STATUS_SUCCESS, "selected expert input gradient");
+        auto * dx = ggml_graph_get_grad(backward, input);
+        check(static_cast<float *>(dx->data)[0] == 4.0f, "selected expert gradient value");
+        check(ggml_graph_get_grad(backward, weights) == nullptr, "no frozen expert gradient");
+        check(bank[expert_elements] == 1.0f, "base remains immutable");
         ggml_free(ctx);
 #if defined(_WIN32)
         VirtualFree(bank, 0, MEM_RELEASE);
@@ -1579,6 +1593,308 @@ static std::pair<int, int> test_expert_parts() {
 #endif
     }
     fprintf(stdout, "expert paging: %d/%d passed\n", pass, total);
+    return {pass, total};
+}
+
+static std::pair<int, int> test_quantized_expert_gradients() {
+    int pass = 0, total = 0;
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+      for (bool routed : {false, true}) {
+        auto * ctx = ggml_init({4*1024*1024, nullptr, false});
+        auto * weights = ggml_new_tensor_3d(ctx, type, 256, 3, 4);
+        std::vector<float> source(256*3*4);
+        for (size_t i = 0; i < source.size(); ++i) source[i] = sinf((float) i * 0.07f);
+        ggml_quantize_chunk(type, source.data(), weights->data, 0, 12, 256, nullptr);
+        std::vector<uint8_t> original(ggml_nbytes(weights));
+        memcpy(original.data(), weights->data, original.size());
+        auto * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 1, 2);
+        ggml_set_f32(input, 1.0f);
+        ggml_set_param(input);
+        auto * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, 2);
+        int32_t routes[] = {1, 3, 3, 0};
+        memcpy(ids->data, routes, sizeof(routes));
+        auto * product = routed ? ggml_mul_mat_id(ctx, weights, input, ids) :
+            ggml_mul_mat(ctx, ggml_view_2d(ctx, weights, 256, 3, weights->nb[1], 0), ggml_reshape_2d(ctx, input, 256, 2));
+        auto * loss = ggml_sum(ctx, product);
+        ggml_set_loss(loss);
+        auto * graph = ggml_new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE, true);
+        ggml_build_forward_expand(graph, loss);
+        ggml_build_backward_expand(ctx, graph, nullptr);
+        ggml_graph_reset(graph);
+        bool ok = ggml_graph_compute_with_ctx(ctx, graph, 2) == GGML_STATUS_SUCCESS;
+        auto * dx = ggml_graph_get_grad(graph, input);
+        float row[256];
+        for (int token = 0; token < 2; ++token) {
+            std::vector<float> expected(256, 0.0f);
+            for (int route = 0; route < (routed ? 2 : 1); ++route) {
+                for (int channel = 0; channel < 3; ++channel) {
+                    const char * data = (const char *) weights->data + (routed ? routes[token*2+route] : 0)*weights->nb[2] + channel*weights->nb[1];
+                    if (type == GGML_TYPE_F32) memcpy(row, data, sizeof(row));
+                    else ggml_get_type_traits(type)->to_float(data, row, 256);
+                    for (int j = 0; j < 256; ++j) expected[j] += row[j];
+                }
+            }
+            for (int j = 0; j < 256; ++j) ok &= fabsf(((float *) dx->data)[token*256+j] - expected[j]) < 1e-5f;
+        }
+        ok &= memcmp(original.data(), weights->data, original.size()) == 0;
+        ok &= ggml_graph_get_grad(graph, weights) == nullptr;
+        ++total;
+        pass += ok;
+        fprintf(stdout, "frozen %s gradients %s: %s\n", routed ? "expert" : "matrix", ggml_type_name(type), ok ? "OK" : "FAIL");
+        ggml_free(ctx);
+      }
+    }
+    return {pass, total};
+}
+
+static std::pair<int, int> test_sparse_loss() {
+    int pass = 0, total = 0;
+    for (int mode = 0; mode < 3; ++mode) {
+        auto * ctx = ggml_init({4*1024*1024, nullptr, false});
+        auto * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 5, 3);
+        auto * labels = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 3);
+        float values[] = {0.2f, -0.7f, 1.1f, 0.4f, -0.2f, 9, -4, 3, 6, 8, -0.1f, 0.5f, 0.3f, -0.4f, 0.2f};
+        int32_t ids[] = {2, -1, 0};
+        if (mode == 1) std::fill(ids, ids+3, -1);
+        if (mode == 2) for (float & value : values) value = 10000.0f;
+        memcpy(logits->data, values, sizeof(values));
+        memcpy(labels->data, ids, sizeof(ids));
+        ggml_set_param(logits);
+        auto * loss = ggml_cross_entropy_loss_sparse(ctx, logits, labels);
+        ggml_set_loss(loss);
+        auto * graph = ggml_new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE, true);
+        ggml_build_forward_expand(graph, loss);
+        ggml_build_backward_expand(ctx, graph, nullptr);
+        ggml_graph_reset(graph);
+        bool ok = ggml_graph_compute_with_ctx(ctx, graph, 3) == GGML_STATUS_SUCCESS;
+        auto * dx = ggml_graph_get_grad(graph, logits);
+        float gradient[15]; memcpy(gradient, dx->data, sizeof(gradient));
+        const float original_loss = *(float *) loss->data;
+        if (mode == 1) ok &= original_loss == 0;
+        if (mode == 2) ok &= fabsf(original_loss - logf(5.0f)) < 1e-6f;
+        for (int i = 0; i < 15; ++i) {
+            if (ids[i/5] == -1) ok &= gradient[i] == 0;
+            const float eps = mode == 2 ? 0.125f : 0.01f;
+            ((float *) logits->data)[i] = values[i]+eps;
+            ggml_graph_compute_with_ctx(ctx, graph, 3);
+            const float plus = *(float *) loss->data;
+            ((float *) logits->data)[i] = values[i]-eps;
+            ggml_graph_compute_with_ctx(ctx, graph, 3);
+            const float minus = *(float *) loss->data;
+            ((float *) logits->data)[i] = values[i];
+            ok &= fabsf((plus-minus)/(2*eps) - gradient[i]) < 3e-4f;
+        }
+        if (mode == 0) {
+            for (int i = 0; i < 15; ++i) ((float *) logits->data)[i] -= 0.1f*gradient[i];
+            ggml_graph_compute_with_ctx(ctx, graph, 3);
+            ok &= *(float *) loss->data < original_loss;
+        }
+        ++total; pass += ok;
+        fprintf(stdout, "sparse masked loss mode %d: %s\n", mode, ok ? "OK" : "FAIL");
+        ggml_free(ctx);
+    }
+    return {pass, total};
+}
+
+static std::pair<int, int> test_l2_norm_gradients() {
+    int pass = 0;
+    for (bool clamped : {false, true}) {
+        auto * ctx = ggml_init({1024*1024, nullptr, false});
+        auto * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2);
+        ((float *) input->data)[0] = clamped ? 0.0f : 3.0f;
+        ((float *) input->data)[1] = clamped ? 0.0f : 4.0f;
+        ggml_set_param(input);
+        auto * loss = ggml_sum(ctx, ggml_l2_norm(ctx, input, 0.1f));
+        ggml_set_loss(loss);
+        auto * graph = ggml_new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE, true);
+        ggml_build_forward_expand(graph, loss);
+        ggml_build_backward_expand(ctx, graph, nullptr);
+        ggml_graph_reset(graph);
+        bool ok = ggml_graph_compute_with_ctx(ctx, graph, 2) == GGML_STATUS_SUCCESS;
+        const auto * derivative = (const float *) ggml_graph_get_grad(graph, input)->data;
+        ok &= fabsf(derivative[0] - (clamped ? 10.0f : 0.032f)) < 1e-6f;
+        ok &= fabsf(derivative[1] - (clamped ? 10.0f : -0.024f)) < 1e-6f;
+        pass += ok;
+        fprintf(stdout, "L2 gradient clamped=%d: %s\n", clamped, ok ? "OK" : "FAIL");
+        ggml_free(ctx);
+    }
+    return {pass, 2};
+}
+
+static bool test_adapter_optimizer(llama_model * model, llama_adapter_lora * adapter) {
+    auto * ctx = ggml_init({4*1024*1024, nullptr, false});
+    auto * weight = model->layers[0].wo;
+    const auto pair = adapter->ab_map.at(weight->name);
+    std::vector<uint8_t> original(ggml_nbytes(weight));
+    ggml_backend_tensor_get(weight, original.data(), 0, original.size());
+    auto * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 1);
+    for (int j = 0; j < 32; ++j) ((float *) input->data)[j] = cosf(j*0.3f);
+    auto * labels = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    *(int32_t *) labels->data = 3;
+    auto * base = ggml_mul_mat(ctx, weight, input);
+    auto * delta = ggml_scale(ctx, ggml_mul_mat(ctx, pair.b, ggml_mul_mat(ctx, pair.a, input)), pair.get_scale(adapter->alpha, 1.0f));
+    auto * loss = ggml_cross_entropy_loss_sparse(ctx, ggml_add(ctx, base, delta), labels);
+    ggml_set_loss(loss);
+    auto * backward = ggml_new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE, true);
+    ggml_build_forward_expand(backward, loss);
+    ggml_build_backward_expand(ctx, backward, nullptr);
+    auto * optimizer = ggml_graph_dup(ctx, backward, true);
+    auto * configuration = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 7);
+    for (auto * parameter : {pair.a, pair.b}) {
+        auto * m = ggml_dup_tensor(ctx, parameter);
+        auto * v = ggml_dup_tensor(ctx, parameter);
+        ggml_set_f32(m, 0);
+        ggml_set_f32(v, 0);
+        ggml_build_forward_expand(optimizer, ggml_opt_step_adamw(ctx, parameter,
+            ggml_graph_get_grad(backward, parameter), m, v, configuration));
+    }
+    float first_loss = 0;
+    bool ok = true;
+    for (int step = 1; step <= 80; ++step) {
+        float settings[] = {0.03f, 0.9f, 0.999f, 1e-8f, 0.01f, 1.0f/(1.0f-powf(0.9f, (float) step)), 1.0f/(1.0f-powf(0.999f, (float) step))};
+        memcpy(configuration->data, settings, sizeof(settings));
+        ggml_graph_reset(backward);
+        ok &= ggml_graph_compute_with_ctx(ctx, optimizer, 2) == GGML_STATUS_SUCCESS;
+        if (step == 1) first_loss = *(float *) loss->data;
+    }
+    const float last_loss = *(float *) loss->data;
+    ok &= std::isfinite(last_loss) && last_loss < first_loss*0.05f;
+    ok &= ggml_graph_get_grad(backward, weight) == nullptr;
+    std::vector<uint8_t> after(original.size());
+    ggml_backend_tensor_get(weight, after.data(), 0, after.size());
+    ok &= after == original;
+    fprintf(stdout, "adapter matrix overfit: %.6f -> %.6f: %s\n", first_loss, last_loss, ok ? "OK" : "FAIL");
+    ggml_free(ctx);
+    return ok;
+}
+
+static std::pair<int, int> test_adapter_buffer() {
+    int pass = 0, total = 0;
+    auto check = [&](bool value, const char * label) {
+        ++total;
+        pass += value;
+        if (!value) fprintf(stderr, "adapter buffer: %s failed\n", label);
+    };
+    auto pack = [](gguf_context * meta, ggml_context * ctx) {
+        size_t size = gguf_get_meta_size(meta);
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            size = std::max(size, gguf_get_meta_size(meta) + gguf_get_tensor_offset(meta, gguf_find_tensor(meta, t->name)) + ggml_nbytes(t));
+        }
+        std::vector<uint8_t> bytes(size, 0);
+        gguf_get_meta_data(meta, bytes.data());
+        return bytes;
+    };
+    auto * ctx = ggml_init({1024*1024, nullptr, true});
+    auto * meta = gguf_init_empty();
+    gguf_set_val_str(meta, "general.architecture", "llama");
+    gguf_set_val_str(meta, "tokenizer.ggml.model", "none");
+    gguf_set_val_u32(meta, "llama.vocab_size", 8);
+    gguf_set_val_u32(meta, "llama.context_length", 32);
+    gguf_set_val_u32(meta, "llama.embedding_length", 32);
+    gguf_set_val_u32(meta, "llama.block_count", 1);
+    gguf_set_val_u32(meta, "llama.feed_forward_length", 32);
+    gguf_set_val_u32(meta, "llama.attention.head_count", 1);
+    gguf_set_val_u32(meta, "llama.attention.head_count_kv", 1);
+    gguf_set_val_f32(meta, "llama.attention.layer_norm_rms_epsilon", 1e-5f);
+    auto tensor = [&](const char * name, int64_t x, int64_t y) {
+        auto * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x, y);
+        ggml_set_name(t, name);
+        gguf_add_tensor(meta, t);
+    };
+    tensor("token_embd.weight", 32, 8);
+    tensor("output_norm.weight", 32, 1);
+    tensor("blk.0.attn_norm.weight", 32, 1);
+    tensor("blk.0.ffn_norm.weight", 32, 1);
+    for (const char * name : {"attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate", "ffn_up", "ffn_down"}) {
+        tensor((std::string("blk.0.") + name + ".weight").c_str(), 32, 32);
+    }
+    auto base = pack(meta, ctx);
+    auto params = llama_model_default_params();
+    params.n_gpu_layers = 0;
+    auto * model = llama_model_load_from_buffer_view(base.data(), base.size(), params);
+    check(model != nullptr, "tiny mapped base");
+    gguf_free(meta);
+    ggml_free(ctx);
+    if (model) {
+        const char * target = "blk.0.attn_output.weight";
+        auto * initialized = llama_adapter_lora_init_training(model, &target, 1, 2, 4.0f, 20260920);
+        check(initialized != nullptr, "initialize training parameters");
+        if (initialized) {
+            const auto pair = initialized->ab_map.at(target);
+            check(std::all_of((float *) pair.b->data, (float *) pair.b->data + ggml_nelements(pair.b), [](float value) { return value == 0.0f; }), "initial neutral B");
+            const size_t size = llama_adapter_lora_export_buffer(initialized, nullptr, 0);
+            std::vector<uint8_t> bytes(size, 0x7f);
+            check(size > 0, "export size");
+            check(llama_adapter_lora_export_buffer(initialized, bytes.data(), size-1) == size && bytes[0] == 0x7f, "undersized buffer unchanged");
+            check(llama_adapter_lora_export_buffer(initialized, bytes.data(), size) == size, "F16 export");
+            auto * same = llama_adapter_lora_init_training(model, &target, 1, 2, 4.0f, 20260920);
+            std::vector<uint8_t> repeated(size);
+            check(same && llama_adapter_lora_export_buffer(same, repeated.data(), size) == size && repeated == bytes, "deterministic initialization");
+            llama_adapter_lora_free(same);
+            check(test_adapter_optimizer(model, initialized), "adapter-only AdamW overfit");
+            check(llama_adapter_lora_export_buffer(initialized, bytes.data(), size) == size && bytes != repeated, "trained export differs");
+            auto * imported = llama_adapter_lora_init_from_buffer(model, bytes.data(), bytes.size());
+            check(imported != nullptr, "trained F16 import");
+            if (imported) {
+                float f32[64];
+                ggml_fp16_t f16[64];
+                ggml_backend_tensor_get(imported->ab_map.at(target).b, f16, 0, sizeof(f16));
+                ggml_fp16_to_fp32_row(f16, f32, 64);
+                bool close = true;
+                for (int j = 0; j < 64; ++j) close &= fabsf(f32[j] - ((float *) pair.b->data)[j]) < 0.001f;
+                check(close, "export preserves learned weights");
+            }
+            llama_adapter_lora_free(imported);
+            ((float *) pair.b->data)[0] = std::numeric_limits<float>::infinity();
+            check(llama_adapter_lora_export_buffer(initialized, bytes.data(), size) == 0, "nonfinite export rejected");
+            llama_adapter_lora_free(initialized);
+        }
+        const char * duplicate[] = {target, target};
+        check(!llama_adapter_lora_init_training(model, duplicate, 2, 2, 4.0f, 1), "duplicate targets rejected");
+        const char * unknown = "missing.weight";
+        check(!llama_adapter_lora_init_training(model, &unknown, 1, 2, 4.0f, 1), "unknown target rejected");
+        ctx = ggml_init({1024*1024, nullptr, true});
+        meta = gguf_init_empty();
+        gguf_set_val_str(meta, "general.architecture", "llama");
+        gguf_set_val_str(meta, "general.type", "adapter");
+        gguf_set_val_str(meta, "adapter.type", "lora");
+        gguf_set_val_f32(meta, "adapter.lora.alpha", 4.0f);
+        gguf_set_val_u64(meta, "adapter.training.optimizer_steps", 42);
+        tensor("blk.0.attn_output.weight.lora_a", 32, 2);
+        tensor("blk.0.attn_output.weight.lora_b", 2, 32);
+        auto bytes = pack(meta, ctx);
+        auto * adapter = llama_adapter_lora_init_from_buffer(model, bytes.data(), bytes.size());
+        check(adapter != nullptr, "valid borrowed adapter");
+        if (adapter) {
+            std::vector<uint8_t> exported(llama_adapter_lora_export_buffer(adapter, nullptr, 0));
+            check(llama_adapter_lora_export_buffer(adapter, exported.data(), exported.size()) == exported.size(), "imported export");
+            auto * metadata = gguf_init_from_buffer(exported.data(), exported.size(), {true, nullptr});
+            const int64_t key = metadata ? gguf_find_key(metadata, "adapter.training.optimizer_steps") : -1;
+            check(key >= 0 && gguf_get_val_u64(metadata, key) == 42, "typed provenance survives export");
+            gguf_free(metadata);
+        }
+        llama_adapter_lora_free(adapter);
+        check(!llama_adapter_lora_init_from_buffer(model, bytes.data(), bytes.size()-1), "truncated payload");
+        const float invalid = std::numeric_limits<float>::quiet_NaN();
+        std::memcpy(bytes.data()+gguf_get_meta_size(meta), &invalid, sizeof(invalid));
+        check(!llama_adapter_lora_init_from_buffer(model, bytes.data(), bytes.size()), "non-finite weights");
+        gguf_set_val_str(meta, "adapter.lora.alpha", "invalid");
+        bytes = pack(meta, ctx);
+        check(!llama_adapter_lora_init_from_buffer(model, bytes.data(), bytes.size()), "wrong metadata type");
+        gguf_set_val_f32(meta, "adapter.lora.alpha", 4.0f);
+        gguf_set_val_str(meta, "general.architecture", "qwen3next");
+        bytes = pack(meta, ctx);
+        check(!llama_adapter_lora_init_from_buffer(model, bytes.data(), bytes.size()), "wrong architecture");
+        gguf_set_val_str(meta, "general.architecture", "llama");
+        tensor("output_norm.weight", 32, 1);
+        bytes = pack(meta, ctx);
+        check(!llama_adapter_lora_init_from_buffer(model, bytes.data(), bytes.size()), "unsupported tensor");
+        check(!llama_adapter_lora_init_from_buffer(model, nullptr, 0), "empty buffer");
+        gguf_free(meta);
+        ggml_free(ctx);
+        llama_model_free(model);
+    }
+    fprintf(stdout, "adapter buffer: %d/%d passed\n", pass, total);
     return {pass, total};
 }
 
@@ -1602,6 +1918,26 @@ int main(int argc, char ** argv) {
 
     int npass = 0;
     int ntest = 0;
+    {
+        auto result = test_l2_norm_gradients();
+        npass += result.first;
+        ntest += result.second;
+    }
+    {
+        auto result = test_sparse_loss();
+        npass += result.first;
+        ntest += result.second;
+    }
+    {
+        auto result = test_quantized_expert_gradients();
+        npass += result.first;
+        ntest += result.second;
+    }
+    {
+        auto result = test_adapter_buffer();
+        npass += result.first;
+        ntest += result.second;
+    }
     {
         auto result = test_expert_parts();
         npass += result.first;

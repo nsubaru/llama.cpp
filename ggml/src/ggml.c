@@ -6239,6 +6239,77 @@ struct ggml_tensor * ggml_custom_inplace(
 
     return result;
 }
+// ggml_cross_entropy_loss_sparse
+
+static int64_t ggml_sparse_label_count(const struct ggml_tensor * logits, const struct ggml_tensor * labels) {
+    const int32_t * ids = labels->data;
+    int64_t count = 0;
+    for (int64_t row = 0; row < ggml_nrows(logits); ++row) {
+        GGML_ASSERT(ids[row] >= -1 && ids[row] < logits->ne[0]);
+        count += ids[row] != -1;
+    }
+    return count;
+}
+
+static double ggml_sparse_log_sum_exp(const float * values, int64_t width, float * maximum) {
+    float high = -INFINITY;
+    for (int64_t col = 0; col < width; ++col) high = fmaxf(high, values[col]);
+    double sum = 0.0;
+    for (int64_t col = 0; col < width; ++col) sum += exp((double) values[col] - high);
+    *maximum = high;
+    return log(sum);
+}
+
+static void ggml_sparse_loss_compute(struct ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth); GGML_UNUSED(userdata);
+    if (ith != 0) return;
+    const struct ggml_tensor * logits = dst->src[0];
+    const struct ggml_tensor * labels = dst->src[1];
+    const int32_t * ids = labels->data;
+    const int64_t count = ggml_sparse_label_count(logits, labels);
+    double loss = 0.0;
+    for (int64_t row = 0; row < ggml_nrows(logits); ++row) {
+        if (ids[row] == -1) continue;
+        const float * values = (const float *) logits->data + row*logits->ne[0];
+        float high;
+        const double log_sum = ggml_sparse_log_sum_exp(values, logits->ne[0], &high);
+        loss += ((double) high - values[ids[row]]) + log_sum;
+    }
+    *(float *) dst->data = count ? (float) (loss/count) : 0.0f;
+}
+
+static void ggml_sparse_loss_grad_compute(struct ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(userdata);
+    const struct ggml_tensor * logits = dst->src[0];
+    const struct ggml_tensor * labels = dst->src[1];
+    const int32_t * ids = labels->data;
+    const int64_t count = ggml_sparse_label_count(logits, labels);
+    const double scale = count ? *(const float *) dst->src[2]->data / (double) count : 0.0;
+    for (int64_t row = ith; row < ggml_nrows(logits); row += nth) {
+        float * output = (float *) dst->data + row*logits->ne[0];
+        if (ids[row] == -1) {
+            memset(output, 0, logits->ne[0]*sizeof(float));
+            continue;
+        }
+        const float * values = (const float *) logits->data + row*logits->ne[0];
+        float high;
+        const double log_sum = ggml_sparse_log_sum_exp(values, logits->ne[0], &high);
+        for (int64_t col = 0; col < logits->ne[0]; ++col)
+            output[col] = (float) (scale * (exp((double) values[col] - high - log_sum) - (col == ids[row])));
+    }
+}
+
+struct ggml_tensor * ggml_cross_entropy_loss_sparse(
+        struct ggml_context * ctx,
+        struct ggml_tensor * logits,
+        struct ggml_tensor * labels) {
+    GGML_ASSERT(logits->type == GGML_TYPE_F32 && ggml_is_contiguous(logits));
+    GGML_ASSERT(labels->type == GGML_TYPE_I32 && ggml_is_contiguous(labels));
+    GGML_ASSERT(ggml_nelements(labels) == ggml_nrows(logits));
+    struct ggml_tensor * args[] = { logits, labels };
+    return ggml_custom_4d(ctx, GGML_TYPE_F32, 1, 1, 1, 1, args, 2, ggml_sparse_loss_compute, 1, NULL);
+}
+
 // ggml_cross_entropy_loss
 
 struct ggml_tensor * ggml_cross_entropy_loss(
@@ -6748,6 +6819,175 @@ static void ggml_sub_or_set(
     ggml_build_forward_expand(cgraph, cgraph->grads[isrc]);
 }
 
+// Input gradients touch selected experts only. Each task owns one output row.
+static void ggml_mul_mat_id_input_grad_compute(struct ggml_tensor * dst, int ith, int nth, void * userdata) {
+    const struct ggml_tensor * weights = dst->src[0];
+    const struct ggml_tensor * grad = dst->src[1];
+    const struct ggml_tensor * ids = dst->src[2];
+    const int64_t block = ggml_blck_size(weights->type);
+    const size_t type_size = ggml_type_size(weights->type);
+    const ggml_to_float_t to_float = ggml_get_type_traits(weights->type)->to_float;
+    GGML_ASSERT(block <= 256 && 256 % block == 0);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32 || to_float);
+    float tile[256];
+    for (int64_t row = ith; row < dst->ne[1] * dst->ne[2]; row += nth) {
+        const int64_t token = row / dst->ne[1];
+        const int64_t lane = row % dst->ne[1];
+        float * output = (float *) ((char *) dst->data + lane * dst->nb[1] + token * dst->nb[2]);
+        memset(output, 0, dst->ne[0] * sizeof(float));
+        for (int64_t route = lane; route < ids->ne[0]; route += dst->ne[1]) {
+            const int32_t expert = *(const int32_t *) ((const char *) ids->data + route * ids->nb[0] + token * ids->nb[1]);
+            GGML_ASSERT(expert >= 0 && expert < weights->ne[2]);
+            for (int64_t channel = 0; channel < weights->ne[1]; ++channel) {
+                const float dy = *(const float *) ((const char *) grad->data + channel * grad->nb[0] + route * grad->nb[1] + token * grad->nb[2]);
+                const char * source = (const char *) weights->data + channel * weights->nb[1] + expert * weights->nb[2];
+                for (int64_t start = 0; start < weights->ne[0]; start += 256) {
+                    const int64_t count = MIN(256, weights->ne[0] - start);
+                    const float * values;
+                    if (weights->type == GGML_TYPE_F32) {
+                        values = (const float *) (source + start * weights->nb[0]);
+                    } else {
+                        to_float(source + (start / block) * type_size, tile, count);
+                        values = tile;
+                    }
+                    for (int64_t j = 0; j < count; ++j) output[start+j] += dy * values[j];
+                }
+            }
+        }
+    }
+    GGML_UNUSED(userdata);
+}
+
+static struct ggml_tensor * ggml_mul_mat_id_input_grad(
+        struct ggml_context * ctx, struct ggml_tensor * weights, struct ggml_tensor * grad,
+        struct ggml_tensor * ids, struct ggml_tensor * input) {
+    GGML_ASSERT(input->type == GGML_TYPE_F32 && grad->type == GGML_TYPE_F32);
+    GGML_ASSERT(input->ne[3] == 1 && input->ne[2] == ids->ne[1]);
+    GGML_ASSERT(weights->nb[0] == ggml_type_size(weights->type));
+    struct ggml_tensor * args[] = {weights, grad, ids};
+    return ggml_custom_4d(ctx, GGML_TYPE_F32, input->ne[0], input->ne[1], input->ne[2], 1,
+            args, 3, ggml_mul_mat_id_input_grad_compute, GGML_N_TASKS_MAX, NULL);
+}
+
+static float ggml_gdn_value(const struct ggml_tensor * t, int64_t x, int64_t y, int64_t z, int64_t w) {
+    return *(const float *) ((const char *) t->data + x*t->nb[0] + y*t->nb[1] + z*t->nb[2] + w*t->nb[3]);
+}
+
+static size_t ggml_gdn_index(const struct ggml_tensor * t, int64_t x, int64_t y, int64_t z, int64_t w) {
+    return (size_t) (x + t->ne[0]*(y + t->ne[1]*(z + t->ne[2]*w)));
+}
+
+static void ggml_gdn_recompute_step(struct ggml_tensor * const * args, float * state, int64_t head, int64_t seq, int64_t token) {
+    const struct ggml_tensor * k = args[1];
+    const struct ggml_tensor * v = args[2];
+    const struct ggml_tensor * g = args[3];
+    const int64_t width = v->ne[0];
+    const int64_t kh = head % k->ne[1];
+    const int64_t ks = seq / (v->ne[3] / k->ne[3]);
+    const float beta = ggml_gdn_value(args[4], 0, head, token, seq);
+    for (int64_t j = 0; j < width; ++j) {
+        float prediction = 0.0f;
+        for (int64_t i = 0; i < width; ++i) {
+            state[j*width+i] *= expf(ggml_gdn_value(g, g->ne[0] == 1 ? 0 : i, head, token, seq));
+            prediction += state[j*width+i] * ggml_gdn_value(k, i, kh, token, ks);
+        }
+        const float delta = beta * (ggml_gdn_value(v, j, head, token, seq) - prediction);
+        for (int64_t i = 0; i < width; ++i) state[j*width+i] += delta * ggml_gdn_value(k, i, kh, token, ks);
+    }
+}
+
+// Serial CPU reference, including grouped Q/K heads. Store square-root-spaced states, then recompute each block.
+static void ggml_gdn_grad_compute(struct ggml_tensor * dst, int ith, int nth, void * userdata) {
+    if (ith != 0) return;
+    GGML_UNUSED(nth);
+    const int64_t snapshots = (intptr_t) userdata;
+    struct ggml_tensor ** a = dst->src;
+    const int64_t width = a[2]->ne[0], heads = a[2]->ne[1], tokens = a[2]->ne[2], seqs = a[2]->ne[3];
+    const size_t state_size = (size_t) width * width;
+    const int64_t block = (int64_t) ceil(sqrt((double) tokens));
+    const int64_t blocks = (tokens + block - 1) / block;
+    const size_t slots = (size_t) (blocks + 1 + block + 1 + 1);
+    GGML_ASSERT(state_size <= SIZE_MAX / sizeof(float) / slots);
+    float * scratch = malloc(slots * state_size * sizeof(float));
+    GGML_ASSERT(scratch);
+    float * boundaries = scratch;
+    float * window = boundaries + (blocks + 1) * state_size;
+    float * ds = window + (block + 1) * state_size;
+    float * derivatives[6];
+    size_t offset = 0;
+    memset(dst->data, 0, ggml_nbytes(dst));
+    for (int input = 0; input < 6; ++input) {
+        derivatives[input] = (float *) dst->data + offset;
+        offset += ggml_nelements(a[input]);
+    }
+    const float * grad = (const float *) a[6]->data;
+    const float scale = 1.0f / sqrtf((float) width);
+    const size_t attention_size = (size_t) ggml_nelements(a[2]);
+    for (int64_t seq = 0; seq < seqs; ++seq) for (int64_t head = 0; head < heads; ++head) {
+        const int64_t qh = head % a[0]->ne[1], kh = head % a[1]->ne[1];
+        const int64_t qs = seq / (seqs / a[0]->ne[3]), ks = seq / (seqs / a[1]->ne[3]);
+        for (int64_t j = 0; j < width; ++j) for (int64_t i = 0; i < width; ++i)
+            boundaries[j*width+i] = ggml_gdn_value(a[5], i, j, head, seq);
+        for (int64_t chunk = 0; chunk < blocks; ++chunk) {
+            float * next = boundaries + (chunk + 1)*state_size;
+            memcpy(next, boundaries + chunk*state_size, state_size*sizeof(float));
+            for (int64_t t = chunk*block; t < MIN(tokens, (chunk+1)*block); ++t) ggml_gdn_recompute_step(a, next, head, seq, t);
+        }
+        memset(ds, 0, state_size*sizeof(float));
+        for (int64_t chunk = blocks; chunk-- > 0;) {
+            const int64_t length = MIN(block, tokens - chunk*block);
+            memcpy(window, boundaries + chunk*state_size, state_size*sizeof(float));
+            for (int64_t local = 0; local < length; ++local) {
+                memcpy(window + (local+1)*state_size, window + local*state_size, state_size*sizeof(float));
+                ggml_gdn_recompute_step(a, window + (local+1)*state_size, head, seq, chunk*block+local);
+            }
+            for (int64_t local = length; local-- > 0;) {
+                const int64_t t = chunk*block+local;
+                const float * previous = window + local*state_size;
+                const float * current = previous + state_size;
+                const float beta = ggml_gdn_value(a[4], 0, head, t, seq);
+                const int64_t slot = tokens - 1 - t;
+                const float * state_grad = slot < snapshots ? grad + attention_size + (slot*seqs*heads + seq*heads+head)*state_size : NULL;
+                float dbeta = 0.0f;
+                for (int64_t j = 0; j < width; ++j) {
+                    const float dy = grad[ggml_gdn_index(a[2], j, head, t, seq)] * scale;
+                    float prediction = 0.0f;
+                    float ddelta = 0.0f;
+                    for (int64_t i = 0; i < width; ++i) {
+                        const size_t s = j*width+i;
+                        const float ki = ggml_gdn_value(a[1], i, kh, t, ks);
+                        const float qi = ggml_gdn_value(a[0], i, qh, t, qs);
+                        const float decay = expf(ggml_gdn_value(a[3], a[3]->ne[0] == 1 ? 0 : i, head, t, seq));
+                        prediction += previous[s] * decay * ki;
+                        ds[s] += dy*qi + (state_grad ? state_grad[s] : 0.0f);
+                        ddelta += ds[s]*ki;
+                        derivatives[0][ggml_gdn_index(a[0], i, qh, t, qs)] += dy*current[s];
+                    }
+                    const float error = ggml_gdn_value(a[2], j, head, t, seq) - prediction;
+                    const float delta = beta*error;
+                    derivatives[2][ggml_gdn_index(a[2], j, head, t, seq)] += ddelta*beta;
+                    dbeta += ddelta*error;
+                    for (int64_t i = 0; i < width; ++i) {
+                        const size_t s = j*width+i;
+                        const int64_t gi = a[3]->ne[0] == 1 ? 0 : i;
+                        const float ki = ggml_gdn_value(a[1], i, kh, t, ks);
+                        const float decay = expf(ggml_gdn_value(a[3], gi, head, t, seq));
+                        const float decayed = previous[s]*decay;
+                        const float dm = ds[s] - ddelta*beta*ki;
+                        derivatives[1][ggml_gdn_index(a[1], i, kh, t, ks)] += ds[s]*delta - ddelta*beta*decayed;
+                        derivatives[3][ggml_gdn_index(a[3], gi, head, t, seq)] += dm*decayed;
+                        ds[s] = dm*decay;
+                    }
+                }
+                derivatives[4][ggml_gdn_index(a[4], 0, head, t, seq)] += dbeta;
+            }
+        }
+        for (int64_t j = 0; j < width; ++j) for (int64_t i = 0; i < width; ++i)
+            derivatives[5][ggml_gdn_index(a[5], i, j, head, seq)] += ds[j*width+i];
+    }
+    free(scratch);
+}
+
 static void ggml_compute_backward(
         struct ggml_context * ctx, struct ggml_cgraph * cgraph, int i, const bool * grads_needed) {
     struct ggml_tensor * tensor = cgraph->nodes[i];
@@ -6896,6 +7136,68 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_rms_norm_back(ctx, grad, src0, eps));
             }
         } break;
+        case GGML_OP_L2_NORM: {
+            if (src0_needs_grads) {
+                const float eps = ggml_get_op_params_f32(tensor, 0);
+                struct ggml_tensor * norm = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, src0)));
+                struct ggml_tensor * active = ggml_step(ctx, ggml_scale_bias(ctx, norm, 1.0f, -eps));
+                struct ggml_tensor * dot = ggml_mul(ctx, active, ggml_sum_rows(ctx, ggml_mul(ctx, tensor, grad)));
+                struct ggml_tensor * numerator = ggml_sub(ctx, grad, ggml_mul(ctx, tensor, dot));
+                struct ggml_tensor * divisor = ggml_repeat(ctx, ggml_clamp(ctx, norm, eps, FLT_MAX), src0);
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_div(ctx, numerator, divisor));
+            }
+        } break;
+        case GGML_OP_GATED_DELTA_NET: {
+            struct ggml_tensor * args[7];
+            int64_t total = 0;
+            for (int input = 0; input < 6; ++input) {
+                args[input] = tensor->src[input];
+                GGML_ASSERT(args[input]->type == GGML_TYPE_F32);
+                GGML_ASSERT(ggml_nelements(args[input]) <= INT64_MAX - total);
+                total += ggml_nelements(args[input]);
+            }
+            GGML_ASSERT(args[2]->ne[2] > 0);
+            args[6] = ggml_cont(ctx, grad);
+            const int64_t snapshots = ggml_get_op_params_i32(tensor, 0);
+            struct ggml_tensor * all = ggml_custom_4d(ctx, GGML_TYPE_F32, total, 1, 1, 1, args, 7,
+                    ggml_gdn_grad_compute, 1, (void *) (intptr_t) snapshots);
+            size_t offset = 0;
+            for (int input = 0; input < 6; ++input) {
+                struct ggml_tensor * source = args[input];
+                const size_t index = ggml_hash_find(hash_set, source);
+                if (grads_needed[index]) {
+                    struct ggml_tensor * part = ggml_view_4d(ctx, all, source->ne[0], source->ne[1], source->ne[2], source->ne[3],
+                            source->ne[0]*sizeof(float), source->ne[0]*source->ne[1]*sizeof(float),
+                            source->ne[0]*source->ne[1]*source->ne[2]*sizeof(float), offset);
+                    ggml_add_or_set(ctx, cgraph, index, part);
+                }
+                offset += ggml_nelements(source)*sizeof(float);
+            }
+        } break;
+        case GGML_OP_SSM_CONV: {
+            const int64_t taps = src1->ne[0];
+            const int64_t channels = src1->ne[1];
+            struct ggml_tensor * dy = ggml_cont(ctx, ggml_transpose(ctx, grad));
+            struct ggml_tensor * dx = NULL;
+            struct ggml_tensor * dc = NULL;
+            GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32);
+            for (int64_t tap = 0; tap < taps; ++tap) {
+                struct ggml_tensor * coefficient = ggml_view_2d(ctx, src1, 1, channels, src1->nb[1], tap * src1->nb[0]);
+                if (src0_needs_grads) {
+                    struct ggml_tensor * part = ggml_mul(ctx, dy, coefficient);
+                    part = ggml_pad_ext(ctx, part, (int) tap, (int) (taps - 1 - tap), 0, 0, 0, 0, 0, 0);
+                    dx = dx ? ggml_add(ctx, dx, part) : part;
+                }
+                if (src1_needs_grads) {
+                    struct ggml_tensor * window = ggml_view_3d(ctx, src0, dy->ne[0], channels, src0->ne[2],
+                            src0->nb[1], src0->nb[2], tap * src0->nb[0]);
+                    struct ggml_tensor * part = ggml_repeat_back(ctx, ggml_sum_rows(ctx, ggml_mul(ctx, dy, window)), coefficient);
+                    dc = dc ? ggml_concat(ctx, dc, part, 0) : part;
+                }
+            }
+            if (src0_needs_grads) ggml_add_or_set(ctx, cgraph, isrc0, dx);
+            if (src1_needs_grads) ggml_add_or_set(ctx, cgraph, isrc1, dc);
+        } break;
         case GGML_OP_MUL_MAT: {
             // https://cs231n.github.io/optimization-2/#staged
             // # forward pass
@@ -6947,6 +7249,13 @@ static void ggml_compute_backward(
                             src0,               // [n,m,q1,r1]
                             ggml_transpose(ctx, // [p,m,qq,rr]
                                 grad)));        // [m,p,qq,rr]
+            }
+        } break;
+        case GGML_OP_MUL_MAT_ID: {
+            GGML_ASSERT(!src0_needs_grads && "MUL_MAT_ID backward requires frozen expert weights");
+            GGML_ASSERT(!src2_needs_grads && "expert selection is not differentiable");
+            if (src1_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc1, ggml_mul_mat_id_input_grad(ctx, src0, grad, src2, src1));
             }
         } break;
         case GGML_OP_SCALE: {
@@ -7190,11 +7499,29 @@ static void ggml_compute_backward(
                         ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad, ggml_sigmoid(ctx, src0)));
                     }
                 } break;
+                case GGML_UNARY_OP_SIGMOID: {
+                    if (src0_needs_grads) {
+                        struct ggml_tensor * derivative = ggml_mul(ctx, tensor, ggml_scale_bias(ctx, tensor, -1.0f, 1.0f));
+                        ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad, derivative));
+                    }
+                } break;
                 default: {
                     fprintf(stderr, "%s: unsupported unary op for backward pass: %s\n",
                         __func__, ggml_unary_op_name(ggml_get_unary_op(tensor)));
                     GGML_ABORT("fatal error");
                 } //break;
+            }
+        } break;
+        case GGML_OP_CUSTOM: {
+            struct ggml_custom_op_params params;
+            memcpy(&params, tensor->op_params, sizeof(params));
+            GGML_ASSERT(params.fun == ggml_sparse_loss_compute && "unsupported custom backward operation");
+            GGML_ASSERT(!src1_needs_grads && "sparse labels are discrete");
+            if (src0_needs_grads) {
+                struct ggml_tensor * args[] = { src0, src1, grad };
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_custom_4d(ctx, GGML_TYPE_F32,
+                    src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], args, 3,
+                    ggml_sparse_loss_grad_compute, GGML_N_TASKS_MAX, NULL));
             }
         } break;
         case GGML_OP_CROSS_ENTROPY_LOSS: {

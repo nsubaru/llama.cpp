@@ -2809,6 +2809,14 @@ extern "C" {
 
     // loss function
 
+    // CPU reference mean cross entropy with sparse I32 labels, one per logits row.
+    // Logits must be contiguous F32. Label -1 masks a row; other labels are in [0, ne[0]).
+    // An entirely masked batch has zero loss and gradients. No one-hot tensor is allocated.
+    GGML_API struct ggml_tensor * ggml_cross_entropy_loss_sparse(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * logits,
+            struct ggml_tensor  * labels);
+
     GGML_API struct ggml_tensor * ggml_cross_entropy_loss(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // logits
