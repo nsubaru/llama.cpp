@@ -71,6 +71,9 @@ struct llama_adapter_lora {
 
     float alpha;
 
+    // Invalidates gradients and optimizer state after parameter commits. Caller serializes access.
+    uint64_t training_revision = 0;
+
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
     gguf_context_ptr export_metadata;

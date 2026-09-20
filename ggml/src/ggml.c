@@ -7194,6 +7194,18 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc0, grad);
             }
         } break;
+        case GGML_OP_CONCAT: {
+            const int dim = ggml_get_op_params_i32(tensor, 0);
+            struct ggml_tensor * contiguous = ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad);
+            for (int s = 0; s < 2; ++s) {
+                if (s == 0 ? !src0_needs_grads : !src1_needs_grads) continue;
+                struct ggml_tensor * source = tensor->src[s];
+                const size_t offset = s == 0 ? 0 : src0->ne[dim]*contiguous->nb[dim];
+                struct ggml_tensor * part = ggml_view_4d(ctx, contiguous, source->ne[0], source->ne[1], source->ne[2], source->ne[3],
+                        contiguous->nb[1], contiguous->nb[2], contiguous->nb[3], offset);
+                ggml_add_or_set(ctx, cgraph, s == 0 ? isrc0 : isrc1, ggml_cont(ctx, part));
+            }
+        } break;
         case GGML_OP_ADD: {
             if (src0_needs_grads) {
                 ggml_add_or_set(ctx, cgraph, isrc0, grad);

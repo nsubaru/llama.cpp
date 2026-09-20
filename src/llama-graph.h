@@ -39,6 +39,7 @@ enum llm_graph_type {
     LLM_GRAPH_TYPE_ENCODER,
     LLM_GRAPH_TYPE_DECODER,
     LLM_GRAPH_TYPE_DECODER_MTP,
+    LLM_GRAPH_TYPE_ADAPTER_TRAINING,
 };
 
 enum llm_fused_op {
@@ -892,7 +893,7 @@ struct llm_graph_fused_node {
 
 class llm_graph_result {
 public:
-    llm_graph_result(int64_t max_nodes);
+    llm_graph_result(int64_t max_nodes, bool gradients = false);
 
     virtual ~llm_graph_result() = default;
 
@@ -955,6 +956,7 @@ public:
     ggml_cgraph * gf;
 
     int64_t max_nodes;
+    const bool gradients;
 
 private:
     // keep a copy of the previous graph parameters

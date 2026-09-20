@@ -1,5 +1,6 @@
 #include "ggml.h"
 #include "llama.h"
+#include "llama-training.h"
 #include "../src/llama-adapter.h"
 #include "../src/llama-model.h"
 #include "ggml-cpu.h"
@@ -23,6 +24,7 @@
 #include <cstdio>
 #include <random>
 #include <limits>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -1988,6 +1990,368 @@ static std::pair<int, int> test_l2_norm_gradients() {
     return {pass, 2};
 }
 
+static std::pair<int, int> test_concat_gradients() {
+    int pass = 0;
+    for (int axis = 0; axis < 4; ++axis) {
+        auto * ctx = ggml_init({1024*1024, nullptr, false});
+        int64_t shape[] = {2, 3, 2, 2};
+        auto * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, shape);
+        shape[axis] += 1;
+        auto * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, shape);
+        for (auto * p : {a, b}) {
+            ggml_set_param(p);
+            for (int64_t i = 0; i < ggml_nelements(p); ++i) ((float *) p->data)[i] = sinf(i*0.17f);
+        }
+        auto * joined = ggml_cont(ctx, ggml_transpose(ctx, ggml_concat(ctx, a, b, axis)));
+        auto * loss = ggml_add(ctx, ggml_sum(ctx, ggml_sqr(ctx, joined)), ggml_sum(ctx, a));
+        ggml_set_loss(loss);
+        auto * graph = ggml_new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE, true);
+        ggml_build_forward_expand(graph, loss);
+        ggml_build_backward_expand(ctx, graph, nullptr);
+        ggml_graph_reset(graph);
+        bool ok = ggml_graph_compute_with_ctx(ctx, graph, 2) == GGML_STATUS_SUCCESS;
+        for (auto * p : {a, b}) {
+            auto * gradient = ggml_graph_get_grad(graph, p);
+            for (int64_t i = 0; i < ggml_nelements(p); ++i) ok &= fabsf(((float *) gradient->data)[i] -
+                (2*((float *) p->data)[i] + (p == a ? 1 : 0))) < 1e-6f;
+        }
+        fprintf(stdout, "concat gradient axis %d with strided incoming gradient: %s\n", axis, ok ? "OK" : "FAIL");
+        pass += ok;
+        ggml_free(ctx);
+    }
+    return {pass, 4};
+}
+
+static std::pair<int, int> test_qwen_training() {
+    int pass = 0, total = 0;
+    auto check = [&](bool value, const char * label) {
+        ++total; pass += value;
+        fprintf(stdout, "Qwen training %s: %s\n", label, value ? "OK" : "FAIL");
+    };
+    for (bool mixed : {false, true}) {
+        const int embd = mixed ? 256 : 32;
+        auto * ctx = ggml_init({1024*1024, nullptr, true});
+        auto * meta = gguf_init_empty();
+        gguf_set_val_str(meta, "general.architecture", "qwen3next");
+        gguf_set_val_str(meta, "tokenizer.ggml.model", "none");
+        for (auto setting : {std::pair<const char *, uint32_t>{"vocab_size", 8}, {"context_length", 64},
+                {"embedding_length", (uint32_t) embd}, {"block_count", 3}, {"feed_forward_length", (uint32_t) embd},
+                {"expert_count", 4}, {"expert_used_count", 2}, {"expert_feed_forward_length", (uint32_t) embd},
+                {"expert_shared_feed_forward_length", (uint32_t) embd}, {"attention.head_count", 2}, {"attention.head_count_kv", 1},
+                {"attention.key_length", 16}, {"attention.value_length", 16}, {"rope.dimension_count", 16},
+                {"ssm.conv_kernel", 4}, {"ssm.inner_size", 16}, {"ssm.state_size", 8}, {"ssm.time_step_rank", 2}, {"ssm.group_count", 1}}) {
+            gguf_set_val_u32(meta, (std::string("qwen3next.") + setting.first).c_str(), setting.second);
+        }
+        const bool recurrent[] = {false, true, false};
+        gguf_set_arr_data(meta, "qwen3next.attention.recurrent_layers", GGUF_TYPE_BOOL, recurrent, 3);
+        gguf_set_val_f32(meta, "qwen3next.attention.layer_norm_rms_epsilon", 1e-5f);
+        auto tensor = [&](const std::string & name, int64_t x, int64_t y = 1, int64_t z = 1) {
+            ggml_type type = GGML_TYPE_F32;
+            if (mixed && x == 256 && y > 1) {
+                const ggml_type formats[] = {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_BF16};
+                type = formats[gguf_get_n_tensors(meta) % 5];
+            }
+            auto * t = ggml_new_tensor_3d(ctx, type, x, y, z);
+            ggml_set_name(t, name.c_str());
+            gguf_add_tensor(meta, t);
+        };
+        tensor("token_embd.weight", embd, 8);
+        tensor("output.weight", embd, 8);
+        tensor("output_norm.weight", embd);
+        std::vector<std::string> targets;
+        for (int il = 0; il < 3; ++il) {
+            const std::string prefix = "blk." + std::to_string(il) + ".";
+            tensor(prefix + "attn_norm.weight", embd);
+            tensor(prefix + "post_attention_norm.weight", embd);
+            if (il == 1) {
+                if (mixed) {
+                    tensor(prefix + "ssm_in.weight", embd, 48);
+                } else {
+                    tensor(prefix + "attn_qkv.weight", embd, 32);
+                    tensor(prefix + "attn_gate.weight", embd, 16);
+                }
+                tensor(prefix + "ssm_conv1d.weight", 4, 32);
+                tensor(prefix + "ssm_dt.bias", 2);
+                tensor(prefix + "ssm_a", 2);
+                tensor(prefix + "ssm_ba.weight", embd, 4);
+                tensor(prefix + "ssm_norm.weight", 8);
+                tensor(prefix + "ssm_out.weight", 16, embd);
+                targets.emplace_back(prefix + "ssm_out.weight");
+            } else {
+                tensor(prefix + "attn_q.weight", embd, 64);
+                tensor(prefix + "attn_k.weight", embd, 16);
+                tensor(prefix + "attn_v.weight", embd, 16);
+                tensor(prefix + "attn_output.weight", 32, embd);
+                tensor(prefix + "attn_q_norm.weight", 16);
+                tensor(prefix + "attn_k_norm.weight", 16);
+                targets.emplace_back(prefix + "attn_output.weight");
+            }
+            tensor(prefix + "ffn_gate_inp.weight", embd, 4);
+            for (const char * name : {"ffn_up_exps.weight", "ffn_gate_exps.weight", "ffn_down_exps.weight"}) tensor(prefix + name, embd, embd, 4);
+            tensor(prefix + "ffn_gate_inp_shexp.weight", embd);
+            for (const char * name : {"ffn_up_shexp.weight", "ffn_gate_shexp.weight", "ffn_down_shexp.weight"}) {
+                tensor(prefix + name, embd, embd);
+                targets.emplace_back(prefix + name);
+            }
+        }
+        const size_t header = gguf_get_meta_size(meta);
+        size_t size = header;
+        for (int64_t i = 0; i < gguf_get_n_tensors(meta); ++i) size = std::max(size, header + gguf_get_tensor_offset(meta, i) + gguf_get_tensor_size(meta, i));
+        std::vector<uint8_t> base(size);
+        gguf_get_meta_data(meta, base.data());
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = t->name;
+            const int64_t index = gguf_find_tensor(meta, t->name);
+            std::vector<float> values(ggml_nelements(t));
+            for (size_t i = 0; i < values.size(); ++i) values[i] = name.find("norm") != std::string::npos ? 1.0f :
+                name.find("ssm_a") != std::string::npos ? -0.5f : (float) (sin(i*0.17 + index*0.63)*0.6/sqrt((double) t->ne[0]));
+            ggml_quantize_chunk(t->type, values.data(), base.data()+header+gguf_get_tensor_offset(meta, index), 0, ggml_nrows(t), t->ne[0], nullptr);
+        }
+        gguf_free(meta);
+        ggml_free(ctx);
+        auto params = llama_model_default_params();
+        params.n_gpu_layers = 0;
+        params.use_extra_bufts = false;
+        auto * model = llama_model_load_from_buffer_view(base.data(), base.size(), params);
+        check(model != nullptr, mixed ? "mixed-format mapped fixture" : "F32 mapped fixture");
+        if (!model) continue;
+        const auto original = base;
+        std::vector<const char *> names;
+        for (const auto & name : targets) names.push_back(name.c_str());
+        auto * adapter = llama_adapter_lora_init_training(model, names.data(), names.size(), 2, 4.0f, 20260920);
+        check(adapter != nullptr, "initialize all target kinds");
+        if (!adapter) { llama_model_free(model); continue; }
+        for (const auto & entry : adapter->ab_map) {
+            for (int64_t i = 0; i < ggml_nelements(entry.second.b); ++i) ((float *) entry.second.b->data)[i] = 0.01f*sinf((float) i);
+        }
+        llama_adapter_training_params config = {4, 2, 128*1024*1024};
+        char error[256];
+        auto * training = llama_adapter_training_init(model, adapter, config, error, sizeof(error));
+        check(training != nullptr, "build complete causal graph");
+        if (!training) {
+            fprintf(stderr, "training init: %s\n", error);
+            llama_adapter_lora_free(adapter); llama_model_free(model); continue;
+        }
+        const size_t workspace = llama_adapter_training_workspace_size(training);
+        check(workspace > 0 && workspace <= config.workspace_budget_bytes, "workspace accounting");
+        auto too_small = config;
+        too_small.workspace_budget_bytes = workspace - 1;
+        auto * rejected = llama_adapter_training_init(model, adapter, too_small, error, sizeof(error));
+        check(rejected == nullptr && strstr(error, "budget"), "reject insufficient workspace");
+        llama_adapter_training_free(rejected);
+        const auto architecture = model->arch;
+        model->arch = LLM_ARCH_LLAMA;
+        rejected = llama_adapter_training_init(model, adapter, config, error, sizeof(error));
+        model->arch = architecture;
+        check(rejected == nullptr && strstr(error, "Qwen3Next"), "reject unsupported architecture");
+        llama_adapter_training_free(rejected);
+        const char * unsupported_target = "blk.0.ffn_gate_inp.weight";
+        auto * unsupported = llama_adapter_lora_init_training(model, &unsupported_target, 1, 2, 4.0f, 0);
+        rejected = llama_adapter_training_init(model, unsupported, config, error, sizeof(error));
+        check(unsupported && !rejected && strstr(error, "target"), "reject unsupported adapter target");
+        llama_adapter_training_free(rejected);
+        llama_adapter_lora_free(unsupported);
+        llama_token tokens[] = {1, 3, 2, 4}, labels[] = {3, -1, 4, 5};
+        float loss = 0;
+        check(llama_adapter_training_compute(training, tokens, labels, &loss, nullptr, nullptr), "full forward and backward");
+        if (*llama_adapter_training_error(training)) fprintf(stderr, "%s\n", llama_adapter_training_error(training));
+        const float first_loss = loss;
+        auto * first = adapter->ab_map.at(targets.front()).a;
+        std::vector<float> gradient(ggml_nelements(first));
+        check(llama_adapter_training_gradient(training, first->name, gradient.data(), gradient.size()) == gradient.size() &&
+            std::any_of(gradient.begin(), gradient.end(), [](float g) { return fabsf(g) > 1e-7f; }), "gradient reaches adapter before recurrent layer");
+        if (!mixed) {
+            bool close = true;
+            for (size_t i : {size_t(0), size_t(11), size_t(31), size_t(57)}) {
+                const float value = ((float *) first->data)[i];
+                const float eps = 0.01f;
+                float plus = NAN, minus = NAN;
+                ((float *) first->data)[i] = value + eps;
+                close &= llama_adapter_training_compute(training, tokens, labels, &plus, nullptr, nullptr);
+                ((float *) first->data)[i] = value - eps;
+                close &= llama_adapter_training_compute(training, tokens, labels, &minus, nullptr, nullptr);
+                ((float *) first->data)[i] = value;
+                close &= std::isfinite(plus) && std::isfinite(minus) && fabsf((plus - minus)/(2*eps) - gradient[i]) < 3e-4f;
+            }
+            check(close, "full-graph finite differences");
+        }
+        auto inference_params = llama_context_default_params();
+        inference_params.n_ctx = 64; inference_params.n_batch = 4; inference_params.n_ubatch = 4;
+        inference_params.n_threads = 2; inference_params.n_threads_batch = 2;
+        inference_params.offload_kqv = false; inference_params.op_offload = false;
+        inference_params.type_k = GGML_TYPE_F32; inference_params.type_v = GGML_TYPE_F32;
+        inference_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        auto inference_loss = [&](llama_adapter_lora * selected_adapter) {
+            auto * inference = llama_init_from_model(model, inference_params);
+            if (!inference) return std::numeric_limits<double>::quiet_NaN();
+            float scale = 1;
+            bool success = llama_set_adapters_lora(inference, &selected_adapter, 1, &scale) == 0;
+            auto batch = llama_batch_init(4, 0, 1);
+            batch.n_tokens = 4;
+            for (int i = 0; i < 4; ++i) {
+                batch.token[i] = tokens[i]; batch.pos[i] = i; batch.n_seq_id[i] = 1;
+                batch.seq_id[i][0] = 0; batch.logits[i] = 1;
+            }
+            success &= llama_decode(inference, batch) == 0;
+            double expected_loss = 0;
+            for (int i = 0; success && i < 4; ++i) if (labels[i] >= 0) {
+                const float * logits = llama_get_logits_ith(inference, i);
+                const float max = *std::max_element(logits, logits+8);
+                double sum = 0;
+                for (int j = 0; j < 8; ++j) sum += exp((double) logits[j] - max);
+                expected_loss += log(sum) + max - logits[labels[i]];
+            }
+            llama_batch_free(batch);
+            llama_free(inference);
+            return success ? expected_loss/3 : std::numeric_limits<double>::quiet_NaN();
+        };
+        check(fabs(inference_loss(adapter) - first_loss) < 2e-5, "loss matches inference with F32 caches");
+        check(!llama_adapter_training_compute(training, tokens, labels, &loss, [](void *) { return true; }, nullptr) &&
+            llama_adapter_training_gradient(training, first->name, nullptr, 0) == 0, "cancellation invalidates gradients");
+        int abort_count = 0;
+        check(!llama_adapter_training_compute(training, tokens, labels, &loss, [](void * count) { return ++*(int *) count >= 4; }, &abort_count) &&
+            abort_count >= 4 && llama_adapter_training_gradient(training, first->name, nullptr, 0) == 0, "cancellation during graph execution");
+        llama_token invalid_labels[] = {-1, -1, -1, -1};
+        check(!llama_adapter_training_compute(training, tokens, invalid_labels, &loss, nullptr, nullptr), "reject entirely masked sequence");
+        invalid_labels[0] = 8;
+        check(!llama_adapter_training_compute(training, tokens, invalid_labels, &loss, nullptr, nullptr), "reject invalid target token");
+        check(llama_adapter_training_compute(training, tokens, labels, &loss, nullptr, nullptr) && loss == first_loss, "repeat starts with fresh recurrent state");
+        float guard = 123.0f;
+        check(llama_adapter_training_gradient(training, first->name, &guard, 1) == gradient.size() && guard == 123.0f, "undersized gradient destination untouched");
+        const char * binding = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        auto settings = llama_adapter_optimizer_default_params();
+        settings.gradient_clip = 0.1f;
+        settings.epsilon = 1e-4f;
+        auto small_state = settings;
+        small_state.state_budget_bytes = 1;
+        auto * bad_optimizer = llama_adapter_optimizer_init(adapter, small_state, binding, error, sizeof(error));
+        check(!bad_optimizer && strstr(error, "budget"), "optimizer budget preflight");
+        llama_adapter_optimizer_free(bad_optimizer);
+        auto * optimizer = llama_adapter_optimizer_init(adapter, settings, binding, error, sizeof(error));
+        check(optimizer != nullptr, "initialize AdamW");
+        if (!optimizer) {
+            llama_adapter_training_free(training); llama_adapter_lora_free(adapter); llama_model_free(model); continue;
+        }
+        auto save = [&](llama_adapter_optimizer * selected) {
+            std::vector<uint8_t> bytes(llama_adapter_optimizer_save(selected, nullptr, 0));
+            if (bytes.empty() || llama_adapter_optimizer_save(selected, bytes.data(), bytes.size()) != bytes.size()) bytes.clear();
+            return bytes;
+        };
+        struct expected_parameter { ggml_tensor * tensor; std::vector<float> values; std::vector<double> gradient; };
+        std::map<std::string, expected_parameter> expected;
+        for (const auto & entry : adapter->ab_map) for (auto * p : {entry.second.a, entry.second.b}) {
+            expected.emplace(p->name, expected_parameter{p, std::vector<float>((float *) p->data, (float *) p->data+ggml_nelements(p)),
+                std::vector<double>(ggml_nelements(p))});
+        }
+        llama_token short_labels[] = {-1, -1, -1, 5};
+        bool accumulated = true;
+        for (const auto * selected : {labels, short_labels}) {
+            accumulated &= llama_adapter_training_compute(training, tokens, selected, &loss, nullptr, nullptr);
+            for (auto & p : expected) {
+                std::vector<float> g(p.second.gradient.size());
+                accumulated &= llama_adapter_training_gradient(training, p.first.c_str(), g.data(), g.size()) == g.size();
+                for (size_t i = 0; i < g.size(); ++i) p.second.gradient[i] += g[i]*(selected == labels ? 3.0 : 1.0)/4.0;
+            }
+            accumulated &= llama_adapter_optimizer_accumulate(optimizer, training);
+            accumulated &= !llama_adapter_optimizer_accumulate(optimizer, training);
+        }
+        check(accumulated && llama_adapter_optimizer_pending_tokens(optimizer) == 4, "token-weighted accumulation consumes each compute once");
+        const auto pending = save(optimizer);
+        check(!pending.empty(), "checkpoint includes pending accumulation");
+        if (pending.empty()) {
+            llama_adapter_optimizer_free(optimizer); llama_adapter_training_free(training); llama_adapter_lora_free(adapter); llama_model_free(model); continue;
+        }
+        std::vector<uint8_t> undersized(pending.size() - 1, 0x5a);
+        check(llama_adapter_optimizer_save(optimizer, undersized.data(), undersized.size()) == pending.size() &&
+            std::all_of(undersized.begin(), undersized.end(), [](uint8_t b) { return b == 0x5a; }), "undersized checkpoint destination untouched");
+        check(!llama_adapter_optimizer_step(optimizer, NAN) && save(optimizer) == pending, "invalid step preserves checkpoint");
+        auto & last_parameter = expected.rbegin()->second;
+        auto * last_value = (float *) last_parameter.tensor->data + last_parameter.values.size() - 1;
+        const float original_last = *last_value;
+        *last_value = std::numeric_limits<float>::max();
+        const bool overflow_rejected = !llama_adapter_optimizer_step(optimizer, std::numeric_limits<float>::max());
+        *last_value = original_last;
+        check(overflow_rejected && save(optimizer) == pending, "late nonfinite candidate commits no parameters or state");
+        auto * clone = llama_adapter_lora_init_training(model, names.data(), names.size(), 2, 4.0f, 17);
+        auto * resumed = llama_adapter_optimizer_init(clone, settings, binding, error, sizeof(error));
+        auto * resumed_training = llama_adapter_training_init(model, clone, config, error, sizeof(error));
+        check(clone && resumed && resumed_training, "create independent resume context");
+        if (!resumed || !resumed_training || pending.empty()) {
+            llama_adapter_optimizer_free(resumed); llama_adapter_training_free(resumed_training); llama_adapter_lora_free(clone);
+            llama_adapter_optimizer_free(optimizer); llama_adapter_training_free(training); llama_adapter_lora_free(adapter); llama_model_free(model); continue;
+        }
+        const auto before_restore = save(resumed);
+        auto corrupted = pending;
+        auto * checkpoint_meta = gguf_init_from_buffer(pending.data(), pending.size(), {true, nullptr});
+        const int64_t last_tensor = gguf_get_n_tensors(checkpoint_meta) - 1;
+        const size_t last_offset = gguf_get_data_offset(checkpoint_meta) + gguf_get_tensor_offset(checkpoint_meta, last_tensor) + gguf_get_tensor_size(checkpoint_meta, last_tensor) - sizeof(float);
+        const float invalid = NAN;
+        memcpy(corrupted.data()+last_offset, &invalid, sizeof(invalid));
+        check(!llama_adapter_optimizer_load(resumed, corrupted.data(), corrupted.size()) && save(resumed) == before_restore, "late corrupt payload restore is atomic");
+        check(!llama_adapter_optimizer_load(resumed, pending.data(), last_offset) && save(resumed) == before_restore, "truncated checkpoint rejected");
+        gguf_set_val_str(checkpoint_meta, "optimizer.binding.sha256", "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        corrupted = pending;
+        gguf_get_meta_data(checkpoint_meta, corrupted.data());
+        check(!llama_adapter_optimizer_load(resumed, corrupted.data(), corrupted.size()) && save(resumed) == before_restore, "different manifest binding rejected");
+        gguf_set_val_str(checkpoint_meta, "optimizer.binding.sha256", binding);
+        gguf_set_val_f32(checkpoint_meta, "optimizer.beta1", 0.5f);
+        gguf_get_meta_data(checkpoint_meta, corrupted.data());
+        check(!llama_adapter_optimizer_load(resumed, corrupted.data(), corrupted.size()) && save(resumed) == before_restore, "different AdamW settings rejected");
+        gguf_free(checkpoint_meta);
+        bool resumed_ok = llama_adapter_training_compute(resumed_training, tokens, labels, &loss, nullptr, nullptr);
+        resumed_ok &= llama_adapter_optimizer_load(resumed, pending.data(), pending.size());
+        check(resumed_ok && save(resumed) == pending && llama_adapter_optimizer_pending_tokens(resumed) == 4 &&
+            !llama_adapter_optimizer_accumulate(resumed, resumed_training), "restore exact weights and state and invalidate old gradients");
+        double squared_norm = 0;
+        for (const auto & p : expected) for (double g : p.second.gradient) squared_norm += g*g;
+        const double clipping = std::min(1.0, settings.gradient_clip/sqrt(squared_norm));
+        const float rate = 0.005f;
+        bool trained = llama_adapter_training_compute(training, tokens, labels, &loss, nullptr, nullptr);
+        trained &= llama_adapter_optimizer_step(optimizer, rate) && llama_adapter_optimizer_step(resumed, rate);
+        check(trained && llama_adapter_training_gradient(training, first->name, nullptr, 0) == 0 &&
+            !llama_adapter_optimizer_accumulate(optimizer, training), "committed step invalidates unconsumed gradients");
+        bool numerical = true;
+        for (const auto & p : expected) for (size_t i = 0; i < p.second.values.size(); ++i) {
+            const double g = p.second.gradient[i]*clipping;
+            const double reference = p.second.values[i]*(1.0-rate*settings.weight_decay) - rate*g/(fabs(g)+settings.epsilon);
+            numerical &= fabs(((const float *) p.second.tensor->data)[i] - reference) < 2e-7;
+        }
+        check(numerical && clipping < 1.0, "AdamW matches independent token-weighted clipped update");
+        check(save(resumed) == save(optimizer), "pending-gradient resume matches first committed step");
+        for (int step = 1; step < 30; ++step) {
+            for (const auto * selected : {labels, short_labels}) {
+                trained &= llama_adapter_training_compute(training, tokens, selected, &loss, nullptr, nullptr);
+                trained &= llama_adapter_optimizer_accumulate(optimizer, training);
+                trained &= llama_adapter_training_compute(resumed_training, tokens, selected, &loss, nullptr, nullptr);
+                trained &= llama_adapter_optimizer_accumulate(resumed, resumed_training);
+            }
+            trained &= llama_adapter_optimizer_step(optimizer, rate) && llama_adapter_optimizer_step(resumed, rate);
+        }
+        check(trained && llama_adapter_optimizer_step_count(optimizer) == 30 && llama_adapter_optimizer_pending_tokens(optimizer) == 0 &&
+            save(optimizer) == save(resumed), "resumed and uninterrupted AdamW checkpoints match exactly");
+        const auto completed = save(optimizer);
+        check(llama_adapter_optimizer_load(resumed, completed.data(), completed.size()) && save(resumed) == completed, "completed-step checkpoint roundtrip");
+        llama_adapter_optimizer_free(resumed);
+        llama_adapter_training_free(resumed_training);
+        llama_adapter_lora_free(clone);
+        llama_adapter_optimizer_free(optimizer);
+        trained &= llama_adapter_training_compute(training, tokens, labels, &loss, nullptr, nullptr);
+        fprintf(stdout, "Qwen %s loss: %.6f -> %.6f\n", mixed ? "mixed" : "F32", first_loss, loss);
+        check(trained && loss < first_loss - 0.02f, "adapter-only loss reduction");
+        const size_t export_size = llama_adapter_lora_export_buffer(adapter, nullptr, 0);
+        std::vector<uint8_t> exported(export_size);
+        check(export_size && llama_adapter_lora_export_buffer(adapter, exported.data(), export_size) == export_size, "export trained Qwen fixture adapter");
+        auto * imported = llama_adapter_lora_init_from_buffer(model, exported.data(), exported.size());
+        check(imported && fabs(inference_loss(imported) - loss) < 1e-3, "reimported F16 adapter preserves trained loss");
+        llama_adapter_lora_free(imported);
+        check(base == original, "mapped base bytes unchanged");
+        llama_adapter_training_free(training);
+        llama_adapter_lora_free(adapter);
+        llama_model_free(model);
+    }
+    return {pass, total};
+}
+
 static bool test_adapter_optimizer(llama_model * model, llama_adapter_lora * adapter) {
     auto * ctx = ggml_init({4*1024*1024, nullptr, false});
     auto * weight = model->layers[0].wo;
@@ -2212,6 +2576,16 @@ int main(int argc, char ** argv) {
     }
     {
         auto result = test_adapter_buffer();
+        npass += result.first;
+        ntest += result.second;
+    }
+    {
+        auto result = test_concat_gradients();
+        npass += result.first;
+        ntest += result.second;
+    }
+    {
+        auto result = test_qwen_training();
         npass += result.first;
         ntest += result.second;
     }

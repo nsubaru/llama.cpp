@@ -1308,7 +1308,7 @@ bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
 // llm_graph_result
 //
 
-llm_graph_result::llm_graph_result(int64_t max_nodes) : max_nodes(max_nodes) {
+llm_graph_result::llm_graph_result(int64_t max_nodes, bool gradients) : max_nodes(max_nodes), gradients(gradients) {
     reset();
 
     const char * LLAMA_GRAPH_RESULT_DEBUG = getenv("LLAMA_GRAPH_RESULT_DEBUG");
@@ -1340,7 +1340,7 @@ void llm_graph_result::reset() {
     inputs.clear();
     fused_nodes.clear();
 
-    buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
+    buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, gradients));
 
     ggml_init_params params = {
         /*.mem_size   =*/ buf_compute_meta.size(),
@@ -1350,7 +1350,7 @@ void llm_graph_result::reset() {
 
     ctx_compute.reset(ggml_init(params));
 
-    gf = ggml_new_graph_custom(ctx_compute.get(), max_nodes, false);
+    gf = ggml_new_graph_custom(ctx_compute.get(), max_nodes, gradients);
 }
 
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {

@@ -143,10 +143,11 @@ llama_model_qwen3next::graph::graph(const llama_model & model, const llm_graph_p
     inpL = build_inp_embd(model.tok_embd);
     cb(inpL, "model.embed_tokens", -1);
 
-    auto * inp = build_inp_mem_hybrid();
+    const bool training = params.gtype == LLM_GRAPH_TYPE_ADAPTER_TRAINING;
+    auto * inp = training ? nullptr : build_inp_mem_hybrid();
 
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = training ? nullptr : build_inp_out_ids();
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
@@ -162,10 +163,10 @@ llama_model_qwen3next::graph::graph(const llama_model & model, const llm_graph_p
         // Determine layer type and build appropriate attention mechanism
         if (hparams.is_recr(il)) {
             // Linear attention layer (gated delta net)
-            cur = build_layer_attn_linear(inp->get_recr(), cur, il);
+            cur = build_layer_attn_linear(inp ? inp->get_recr() : nullptr, cur, il);
         } else {
             // Full attention layer
-            cur = build_layer_attn(inp->get_attn(), cur, inp_pos, il);
+            cur = build_layer_attn(inp ? inp->get_attn() : nullptr, cur, inp_pos, il);
         }
 
         if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
@@ -291,9 +292,17 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn(
 
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    cur = build_attn(inp,
-                nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    if (inp) {
+        cur = build_attn(inp,
+                    nullptr, nullptr, nullptr,
+                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    } else {
+        cur = ggml_attention_training(ctx0,
+                ggml_permute(ctx0, Qcur, 0, 2, 1, 3),
+                ggml_permute(ctx0, Kcur, 0, 2, 1, 3),
+                ggml_permute(ctx0, Vcur, 0, 2, 1, 3), kq_scale, 0);
+        cur = ggml_reshape_2d(ctx0, cur, n_embd_head*n_head, n_tokens);
+    }
     cb(cur, "attn_pregate", il);
 
     // TODO: CUDA is missing non-contiguous unary ops. when implemented: remove this cont
@@ -396,7 +405,7 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn_linear(
         llm_graph_input_rs * inp,
         ggml_tensor *        cur,
         int                  il) {
-    const auto * mctx_cur = inp->mctx;
+    const auto * mctx_cur = inp ? inp->mctx : nullptr;
 
     const int64_t d_inner      = hparams.ssm_d_inner;
     const int64_t n_seqs       = ubatch.n_seqs;
@@ -455,17 +464,24 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn_linear(
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
 
-    ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
-    ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
+    ggml_tensor * conv_states_all = mctx_cur ? mctx_cur->get_r_l(il) : nullptr;
+    ggml_tensor * ssm_states_all  = mctx_cur ? mctx_cur->get_s_l(il) : nullptr;
 
     ggml_tensor * conv_kernel      = model.layers[il].ssm_conv1d;
     const int64_t conv_kernel_size = conv_kernel->ne[0];
     const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
 
-    ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
-
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+    ggml_tensor * conv_input;
+    ggml_tensor * state;
+    if (inp) {
+        conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+        state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+        state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+    } else {
+        auto * prefix = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, conv_kernel_size - 1, conv_channels, n_seqs), 0.0f);
+        conv_input = ggml_concat(ctx0, prefix, ggml_transpose(ctx0, qkv_mixed), 0);
+        state = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, head_v_dim, head_v_dim, num_v_heads, n_seqs), 0.0f);
+    }
     cb(state, "state_predelta", il);
 
     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
@@ -540,7 +556,8 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
+    ggml_tensor * output = inp ? build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il) :
+        build_delta_net_fused(q_conv, k_conv, v_conv, gate, beta, state, il).first;
 
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
