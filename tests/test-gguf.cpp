@@ -1,4 +1,15 @@
 #include "ggml.h"
+#include "llama.h"
+#include "ggml-cpu.h"
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 #include "ggml-backend.h"
 #include "../ggml/src/ggml-impl.h"
 #include "gguf.h"
@@ -9,6 +20,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <random>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -1426,6 +1438,150 @@ static std::pair<int, int> test_gguf_set_kv(ggml_backend_dev_t dev, const unsign
     return std::make_pair(npass, ntest);
 }
 
+
+// Expert descriptors and copying must remain independent of model allocation and weight residency.
+static std::pair<int, int> test_expert_parts() {
+    int pass = 0, total = 0;
+    auto check = [&](bool value, const char * name) {
+        ++total;
+        if (value) ++pass;
+        else fprintf(stderr, "expert paging: %s failed\n", name);
+    };
+    for (bool fused : {false, true}) {
+        for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+            ggml_context * ctx = ggml_init({1024*1024, nullptr, true});
+            gguf_context * meta = gguf_init_empty();
+            gguf_set_val_str(meta, "general.architecture", "qwen3next");
+            gguf_set_val_u32(meta, "qwen3next.expert_count", 3);
+            std::vector<const char *> names = fused
+                ? std::vector<const char *>{"blk.0.ffn_gate_up_exps.weight", "blk.0.ffn_down_exps.weight"}
+                : std::vector<const char *>{"blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight", "blk.0.ffn_down_exps.weight"};
+            size_t bytes = 0;
+            for (const auto * name : names) {
+                auto * tensor = ggml_new_tensor_3d(ctx, type, 256, 32, 3);
+                ggml_set_name(tensor, name);
+                gguf_add_tensor(meta, tensor);
+                bytes += GGML_PAD(ggml_nbytes(tensor), 32);
+            }
+            const size_t header = gguf_get_meta_size(meta);
+            std::vector<uint8_t> source(header+bytes, 0);
+            gguf_get_meta_data(meta, source.data());
+            std::vector<llama_model_tensor_part> parts(names.size());
+            check(llama_model_describe_expert_parts(source.data(), source.size(), nullptr, 0) == (int)names.size(), "bank count");
+            check(llama_model_describe_expert_parts(source.data(), source.size(), parts.data(), parts.size()) == (int)names.size(), "bank metadata");
+            check(llama_model_describe_expert_parts(source.data(), source.size()-1, nullptr, 0) == -1, "truncated bank");
+            for (size_t i=0; i<parts.size(); ++i) {
+                const auto & part = parts[i];
+                check(std::string(part.name) == names[i] && part.ne[2] == 3 && part.type == type, "preserved layout");
+                std::vector<uint8_t> dest(part.size, 0x5a);
+                check(!llama_model_copy_expert_part(source.data(), source.size(), &part, dest.data(), dest.size(),
+                    [](float, void *) { return false; }, nullptr), "cancel before payload read");
+                check(dest.front() == 0x5a && dest.back() == 0x5a, "cancellation leaves destination untouched");
+                check(llama_model_copy_expert_part(source.data(), source.size(), &part, dest.data(), dest.size(), nullptr, nullptr), "copy bank");
+                check(std::memcmp(dest.data(), source.data()+part.offset, part.size) == 0, "exact quantized copy");
+                check(!llama_model_copy_expert_part(source.data(), source.size(), &part, dest.data(), dest.size()-1, nullptr, nullptr), "short destination");
+                check(!llama_model_copy_expert_part(source.data(), source.size(), &part, source.data()+part.offset, part.size, nullptr, nullptr), "overlapping destination");
+                auto invalid = part;
+                ++invalid.ne[1];
+                check(!llama_model_copy_expert_part(source.data(), source.size(), &invalid, dest.data(), dest.size(), nullptr, nullptr), "changed dimensions");
+                invalid = part;
+                invalid.offset = UINT64_MAX;
+                check(!llama_model_copy_expert_part(source.data(), source.size(), &invalid, dest.data(), dest.size(), nullptr, nullptr), "invalid source range");
+            }
+            std::vector<llama_model_tensor_view> views;
+            for (const auto & part : parts) views.push_back({part.name, source.data()+part.offset, (size_t)part.size});
+            auto params = llama_model_default_params();
+            check(llama_model_load_from_expert_views(source.data(), source.size(), views.data(), views.size()-1, params) == nullptr, "missing view");
+            auto saved = views[0];
+            views[0].data = nullptr;
+            check(llama_model_load_from_expert_views(source.data(), source.size(), views.data(), views.size(), params) == nullptr, "null view");
+            views[0] = saved;
+            --views[0].size;
+            check(llama_model_load_from_expert_views(source.data(), source.size(), views.data(), views.size(), params) == nullptr, "wrong view size");
+            views[0] = saved;
+            views[1].name = views[0].name;
+            check(llama_model_load_from_expert_views(source.data(), source.size(), views.data(), views.size(), params) == nullptr, "duplicate view");
+            gguf_free(meta);
+            ggml_free(ctx);
+        }
+    }
+
+    {
+        ggml_context * ctx = ggml_init({1024*1024, nullptr, true});
+        gguf_context * meta = gguf_init_empty();
+        gguf_set_val_str(meta, "general.architecture", "qwen3next");
+        gguf_set_val_u32(meta, "qwen3next.expert_count", 2);
+        auto * tensor = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1024, 1024, 2);
+        ggml_set_name(tensor, "blk.0.ffn_up_exps.weight");
+        gguf_add_tensor(meta, tensor);
+        const size_t header = gguf_get_meta_size(meta);
+        std::vector<uint8_t> source(header+ggml_nbytes(tensor), 0);
+        gguf_get_meta_data(meta, source.data());
+        llama_model_tensor_part part;
+        check(llama_model_describe_expert_parts(source.data(), source.size(), &part, 1) == 1, "large bank metadata");
+        std::vector<uint8_t> dest(part.size, 0x5a);
+        int callbacks = 0;
+        check(!llama_model_copy_expert_part(source.data(), source.size(), &part, dest.data(), dest.size(),
+            [](float, void * value) { return ++*static_cast<int *>(value) == 1; }, &callbacks), "cancel between chunks");
+        check(callbacks == 2 && dest.front() == 0 && dest.back() == 0x5a, "bounded partial copy");
+        const float invalid = std::numeric_limits<float>::quiet_NaN();
+        std::memcpy(source.data()+part.offset, &invalid, sizeof(invalid));
+        check(!llama_model_copy_expert_part(source.data(), source.size(), &part, dest.data(), dest.size(), nullptr, nullptr), "reject invalid expert payload");
+        gguf_free(meta);
+        ggml_free(ctx);
+    }
+
+    // MUL_MAT_ID must touch only the routed expert. Other complete expert ranges
+    // are inaccessible, which catches eager reads instead of relying on RSS measurements.
+#if defined(_WIN32)
+    SYSTEM_INFO system_info;
+    GetSystemInfo(&system_info);
+    const size_t expert_bytes = system_info.dwPageSize;
+#else
+    const size_t expert_bytes = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+#endif
+    const size_t expert_elements = expert_bytes / sizeof(float);
+    const int64_t width = static_cast<int64_t>(expert_elements / 4);
+#if defined(_WIN32)
+    auto * bank = static_cast<float *>(VirtualAlloc(nullptr, 3*expert_bytes, MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE));
+#else
+    auto * bank = static_cast<float *>(mmap(nullptr, 3*expert_bytes, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0));
+    if (bank == MAP_FAILED) bank = nullptr;
+#endif
+    check(bank != nullptr, "protected bank allocation");
+    if (bank != nullptr) {
+        std::fill(bank+expert_elements, bank+2*expert_elements, 1.0f);
+#if defined(_WIN32)
+        DWORD old;
+        check(VirtualProtect(bank, expert_bytes, PAGE_NOACCESS, &old) != 0, "protect first expert");
+        check(VirtualProtect(bank+2*expert_elements, expert_bytes, PAGE_NOACCESS, &old) != 0, "protect last expert");
+#else
+        check(mprotect(bank, expert_bytes, PROT_NONE) == 0, "protect first expert");
+        check(mprotect(bank+2*expert_elements, expert_bytes, PROT_NONE) == 0, "protect last expert");
+#endif
+        ggml_context * ctx = ggml_init({4*1024*1024, nullptr, false});
+        auto * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, width, 4, 3);
+        weights->data = bank;
+        auto * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, width, 1, 1);
+        std::fill(static_cast<float *>(input->data), static_cast<float *>(input->data)+width, 1.0f);
+        auto * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, 1);
+        *static_cast<int32_t *>(ids->data) = 1;
+        auto * output = ggml_mul_mat_id(ctx, weights, input, ids);
+        auto * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, output);
+        check(ggml_graph_compute_with_ctx(ctx, graph, 2) == GGML_STATUS_SUCCESS, "selected expert compute");
+        check(static_cast<float *>(output->data)[0] == static_cast<float>(width), "selected expert result");
+        ggml_free(ctx);
+#if defined(_WIN32)
+        VirtualFree(bank, 0, MEM_RELEASE);
+#else
+        munmap(bank, 3*expert_bytes);
+#endif
+    }
+    fprintf(stdout, "expert paging: %d/%d passed\n", pass, total);
+    return {pass, total};
+}
+
 static void print_usage() {
     printf("usage: test-gguf [seed]\n");
     printf("  if no seed is unspecified then a random seed is used\n");
@@ -1446,6 +1602,11 @@ int main(int argc, char ** argv) {
 
     int npass = 0;
     int ntest = 0;
+    {
+        auto result = test_expert_parts();
+        npass += result.first;
+        ntest += result.second;
+    }
     {
         std::pair<int, int> result = test_handcrafted_file(seed);
         npass += result.first;

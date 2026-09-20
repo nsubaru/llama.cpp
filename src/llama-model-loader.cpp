@@ -1211,7 +1211,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
-        if (is_lazy) {
+        if (is_lazy || borrowed_tensor_views.count(tn.str()) != 0) {
             return lazy_read::buft();
         }
 
@@ -1539,13 +1539,20 @@ bool llama_model_loader::load_all_data(
                 throw std::runtime_error(format("tensor '%s' data is not within the borrowed buffer", ggml_get_name(t)));
             }
 
-            uint8_t * source = const_cast<uint8_t *>(borrowed_buffer_data + offset);
-            if (check_tensors && !ggml_validate_row_data(t->type, source, nbytes)) {
+            const auto external = borrowed_tensor_views.find(ggml_get_name(t));
+            uint8_t * source = const_cast<uint8_t *>(external == borrowed_tensor_views.end()
+                ? borrowed_buffer_data + offset : static_cast<const uint8_t *>(external->second.data));
+            if (external != borrowed_tensor_views.end() && (external->second.size != nbytes || t->data != source)) {
+                throw std::runtime_error(format("expert tensor '%s' is not bound to its borrowed view", ggml_get_name(t)));
+            }
+            if (check_tensors && external == borrowed_tensor_views.end() && !ggml_validate_row_data(t->type, source, nbytes)) {
                 throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(t)));
             }
 
             ggml_backend_buffer_t view_buffer = bufs.count(0) ? bufs.at(0) : nullptr;
-            if (view_buffer != nullptr && t->data == nullptr) {
+            if (t->data == source) {
+                // Already bound to immutable application storage.
+            } else if (view_buffer != nullptr && t->data == nullptr) {
                 if (ggml_backend_tensor_alloc(view_buffer, t, source) != GGML_STATUS_SUCCESS) {
                     throw std::runtime_error(format("failed to bind tensor '%s' to the borrowed buffer", ggml_get_name(t)));
                 }

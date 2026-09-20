@@ -1777,38 +1777,28 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 throw std::runtime_error(format("%s: CPU backend cannot create a buffer view from the borrowed model data", __func__));
             }
 
-            size_t first = std::numeric_limits<size_t>::max();
-            size_t last = 0;
             for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-                const int64_t tensor_idx = gguf_find_tensor(ml.metadata, ggml_get_name(t));
-                if (tensor_idx < 0) {
+                const int64_t tid = gguf_find_tensor(ml.metadata, ggml_get_name(t));
+                if (tid < 0) {
                     throw std::runtime_error(format("tensor '%s' not found in the model", ggml_get_name(t)));
                 }
-
-                const size_t offset = gguf_get_data_offset(ml.metadata) + gguf_get_tensor_offset(ml.metadata, tensor_idx);
+                const size_t offset = gguf_get_data_offset(ml.metadata) + gguf_get_tensor_offset(ml.metadata, tid);
                 const size_t nbytes = ggml_nbytes(t);
                 if (offset > ml.borrowed_buffer_size || nbytes > ml.borrowed_buffer_size - offset) {
-                    throw std::runtime_error(format("tensor '%s' data is not within the borrowed buffer", ggml_get_name(t)));
+                    throw std::runtime_error(format("tensor '%s' is outside the borrowed buffer", ggml_get_name(t)));
                 }
-                first = std::min(first, offset);
-                last = std::max(last, offset + nbytes);
+                const auto external = ml.borrowed_tensor_views.find(ggml_get_name(t));
+                const void * source = external == ml.borrowed_tensor_views.end()
+                    ? ml.borrowed_buffer_data + offset : external->second.data;
+                if (external != ml.borrowed_tensor_views.end() && external->second.size != nbytes) {
+                    throw std::runtime_error(format("tensor '%s' borrowed view size mismatch", ggml_get_name(t)));
+                }
+                ggml_backend_buffer_ptr buf(ggml_backend_dev_buffer_from_host_ptr(dev, const_cast<void *>(source), nbytes, nbytes));
+                if (!buf || ggml_backend_tensor_alloc(buf.get(), t, const_cast<void *>(source)) != GGML_STATUS_SUCCESS) {
+                    throw std::runtime_error(format("cannot bind tensor '%s' to borrowed storage", ggml_get_name(t)));
+                }
+                bufs.emplace_back(std::move(buf));
             }
-
-            if (first >= last) {
-                throw std::runtime_error(format("%s: borrowed model buffer has no CPU tensors", __func__));
-            }
-
-            const size_t max_size = ggml_get_max_tensor_size(ctx);
-            ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(
-                dev,
-                const_cast<uint8_t *>(ml.borrowed_buffer_data + first),
-                last - first,
-                max_size);
-            if (buf == nullptr) {
-                throw std::runtime_error(format("unable to allocate %s borrowed buffer view", ggml_backend_buft_name(buft)));
-            }
-            bufs.emplace_back(buf);
-            buf_map.emplace(0, buf);
         } else if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {

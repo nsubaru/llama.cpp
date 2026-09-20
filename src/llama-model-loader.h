@@ -133,6 +133,7 @@ struct llama_model_loader {
     void * set_tensor_data_ud;
     const uint8_t * borrowed_buffer_data;
     size_t borrowed_buffer_size;
+    std::unordered_map<std::string, llama_model_tensor_view> borrowed_tensor_views;
     std::vector<ggml_context_ptr> contexts;
 
     std::string arch_name;

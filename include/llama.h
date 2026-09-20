@@ -540,6 +540,40 @@ extern "C" {
                                   size_t   size,
               struct llama_model_params   params);
 
+    // A complete contiguous routed-expert tensor, described without reading its weights.
+    struct llama_model_tensor_part {
+        char name[64];
+        uint64_t offset;
+        uint64_t size;
+        int64_t ne[4];
+        int32_t type;
+    };
+
+    // A borrowed immutable expert bank. Keep its address and contents valid until model free.
+    struct llama_model_tensor_view {
+        const char * name;
+        const void * data;
+        size_t size;
+    };
+
+    // Return the expert-bank count, or -1 for malformed/unsupported expert layouts.
+    // Pass NULL/0 to query capacity. This parses metadata only, never tensor contents.
+    LLAMA_API int32_t llama_model_describe_expert_parts(
+        const void * data, size_t size, struct llama_model_tensor_part * parts, size_t capacity);
+
+    // Copy and validate one described bank in bounded, row-aligned chunks. False includes cancellation.
+    // The destination belongs to the caller and is writable only during preparation.
+    LLAMA_API bool llama_model_copy_expert_part(
+        const void * data, size_t size, const struct llama_model_tensor_part * part,
+        void * destination, size_t capacity, llama_progress_callback progress, void * userdata);
+
+    // Borrow every routed-expert bank from independent, prevalidated read-only mappings.
+    // Expert contents are never scanned, copied, locked or repacked; other tensors use the GGUF view.
+    // All expert banks must be supplied exactly once. Contexts disable automatic host-operation offload.
+    LLAMA_API struct llama_model * llama_model_load_from_expert_views(
+        const void * data, size_t size, const struct llama_model_tensor_view * views,
+        size_t count, struct llama_model_params params);
+
     // Load a model from multiple splits (support custom naming scheme)
     // The paths must be in the correct order
     LLAMA_API struct llama_model * llama_model_load_from_splits(

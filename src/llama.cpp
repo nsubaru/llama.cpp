@@ -315,16 +315,23 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params,
-        const uint8_t * borrowed_buffer_data, size_t borrowed_buffer_size) {
+        const uint8_t * borrowed_buffer_data, size_t borrowed_buffer_size,
+        const llama_model_tensor_view * views, size_t view_count) {
     try {
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
             params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides,
             borrowed_buffer_data, borrowed_buffer_size);
 
+        for (size_t i = 0; i < view_count; ++i) {
+            if (!ml.borrowed_tensor_views.emplace(views[i].name, views[i]).second) {
+                throw std::runtime_error("duplicate borrowed tensor view");
+            }
+        }
         ml.lazy.mode = params.lazy_mode;
 
         ml.print_info();
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
+        model_ptr->has_external_experts = view_count != 0;
 
         bool ok = llama_prepare_model_devices(params, model_ptr.get());
         if (!ok) {
@@ -388,7 +395,8 @@ static struct llama_model * llama_model_load_from_file_impl(
         FILE * file,
         struct llama_model_params params,
         const uint8_t * borrowed_buffer_data = nullptr,
-        size_t borrowed_buffer_size = 0) {
+        size_t borrowed_buffer_size = 0,
+        const llama_model_tensor_view * views = nullptr, size_t view_count = 0) {
     {
         int n_sources_defined = 0;
         if (metadata != nullptr) {
@@ -431,7 +439,7 @@ static struct llama_model * llama_model_load_from_file_impl(
 
     const auto [status, model] = llama_model_load(
         metadata, set_tensor_data, set_tensor_data_ud, path_model, splits, file, params,
-        borrowed_buffer_data, borrowed_buffer_size);
+        borrowed_buffer_data, borrowed_buffer_size, views, view_count);
     GGML_ASSERT(status <= 0);
     if (status < 0) {
         if (status == -1) {
@@ -571,6 +579,137 @@ struct llama_model * llama_model_load_from_buffer_view(
     gguf_free(metadata);
     return model;
 }
+static std::vector<llama_model_tensor_part> describe_expert_parts(const void * data, size_t size) {
+    if (!data || !size) throw std::runtime_error("empty GGUF view");
+    gguf_context_ptr meta(gguf_init_from_buffer(data, size, {true, nullptr}));
+    if (!meta) throw std::runtime_error("invalid GGUF metadata");
+    const auto arch_key = gguf_find_key(meta.get(), "general.architecture");
+    if (arch_key < 0 || gguf_get_kv_type(meta.get(), arch_key) != GGUF_TYPE_STRING) {
+        throw std::runtime_error("missing GGUF architecture");
+    }
+    const std::string arch_name = gguf_get_val_str(meta.get(), arch_key);
+    const LLM_TN tn(llm_arch_from_string(arch_name));
+    const auto experts_key = gguf_find_key(meta.get(), (arch_name + ".expert_count").c_str());
+    if (experts_key < 0) return {};
+    if (gguf_get_kv_type(meta.get(), experts_key) != GGUF_TYPE_UINT32) {
+        throw std::runtime_error("invalid expert count type");
+    }
+    const auto experts = gguf_get_val_u32(meta.get(), experts_key);
+    if (!experts) return {};
+    std::vector<llama_model_tensor_part> result;
+    for (int64_t i = 0; i < gguf_get_n_tensors(meta.get()); ++i) {
+        const std::string name = gguf_get_tensor_name(meta.get(), i);
+        int layer = -1;
+        if (sscanf(name.c_str(), "blk.%d.", &layer) != 1 || layer < 0) continue;
+        bool bank = false;
+        for (auto kind : {LLM_TENSOR_FFN_GATE_EXPS, LLM_TENSOR_FFN_UP_EXPS,
+                          LLM_TENSOR_FFN_DOWN_EXPS, LLM_TENSOR_FFN_GATE_UP_EXPS}) {
+            bank = bank || name == tn(kind, "weight", layer).str();
+        }
+        if (!bank) {
+            if (name.find("_exps.") != std::string::npos || name.find("_ch_exps.") != std::string::npos) {
+                throw std::runtime_error("unsupported routed expert tensor: " + name);
+            }
+            continue;
+        }
+        const auto * ne = gguf_get_tensor_ne(meta.get(), i);
+        const auto type = gguf_get_tensor_type(meta.get(), i);
+        if (name.size() >= sizeof(llama_model_tensor_part::name) || ne[2] != experts || ne[3] != 1 ||
+            ne[0] <= 0 || ne[1] <= 0 || ne[0] % ggml_blck_size(type) != 0) {
+            throw std::runtime_error("unsupported expert bank layout: " + name);
+        }
+        const size_t base = gguf_get_data_offset(meta.get());
+        const size_t offset = gguf_get_tensor_offset(meta.get(), i);
+        const size_t bytes = gguf_get_tensor_size(meta.get(), i);
+        if (base > size || offset > size - base || bytes > size - base - offset) {
+            throw std::runtime_error("expert bank is outside GGUF view");
+        }
+        llama_model_tensor_part part{};
+        memcpy(part.name, name.c_str(), name.size() + 1);
+        part.offset = base + offset;
+        part.size = bytes;
+        part.type = type;
+        std::copy(ne, ne + 4, part.ne);
+        result.push_back(part);
+    }
+    if (result.empty()) throw std::runtime_error("model has no supported contiguous expert banks");
+    return result;
+}
+
+int32_t llama_model_describe_expert_parts(const void * data, size_t size, llama_model_tensor_part * parts, size_t capacity) {
+    try {
+        const auto description = describe_expert_parts(data, size);
+        if (description.size() > INT32_MAX || (parts && capacity < description.size())) return -1;
+        if (parts) std::copy(description.begin(), description.end(), parts);
+        return (int32_t)description.size();
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+        return -1;
+    }
+}
+
+bool llama_model_copy_expert_part(const void * data, size_t size, const llama_model_tensor_part * part,
+        void * destination, size_t capacity, llama_progress_callback progress, void * userdata) {
+    try {
+        if (!part || !destination || !memchr(part->name, 0, sizeof(part->name))) return false;
+        const auto description = describe_expert_parts(data, size);
+        const auto found = std::find_if(description.begin(), description.end(), [&](const llama_model_tensor_part & p) {
+            return strcmp(p.name, part->name) == 0;
+        });
+        if (found == description.end() || found->offset != part->offset || found->size != part->size ||
+            found->type != part->type || !std::equal(found->ne, found->ne + 4, part->ne) || capacity < part->size) return false;
+        const size_t row = ggml_row_size((ggml_type)part->type, part->ne[0]);
+        const size_t chunk = std::max<size_t>(1, (4 * 1024 * 1024) / row) * row;
+        const auto * source = static_cast<const uint8_t *>(data) + part->offset;
+        const auto src = reinterpret_cast<uintptr_t>(source), dst = reinterpret_cast<uintptr_t>(destination);
+        if (part->size > UINTPTR_MAX - dst || (src <= dst ? dst - src < part->size : src - dst < part->size)) return false;
+        for (size_t offset = 0; offset < part->size;) {
+            if (progress && !progress((float)offset / part->size, userdata)) return false;
+            const size_t n = std::min<size_t>(chunk, part->size - offset);
+            if (!ggml_validate_row_data((ggml_type)part->type, source + offset, n)) return false;
+            memcpy(static_cast<uint8_t *>(destination) + offset, source + offset, n);
+            offset += n;
+        }
+        return !progress || progress(1.0f, userdata);
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+        return false;
+    }
+}
+
+struct llama_model * llama_model_load_from_expert_views(const void * data, size_t size,
+        const llama_model_tensor_view * views, size_t count, llama_model_params params) {
+    try {
+        const auto description = describe_expert_parts(data, size);
+        if (count != description.size() || (count && !views) || params.no_alloc) {
+            throw std::runtime_error("complete expert views are required");
+        }
+        std::set<std::string> names;
+        for (size_t i = 0; i < count; ++i) {
+            const auto & view = views[i];
+            if (!view.name || !view.data || view.size > UINTPTR_MAX - reinterpret_cast<uintptr_t>(view.data) ||
+                reinterpret_cast<uintptr_t>(view.data) % GGML_MEM_ALIGN != 0 ||
+                !names.insert(view.name).second) throw std::runtime_error("invalid or duplicate expert view");
+            const auto found = std::find_if(description.begin(), description.end(), [&](const llama_model_tensor_part & p) {
+                return strcmp(p.name, view.name) == 0;
+            });
+            if (found == description.end() || found->size != view.size) throw std::runtime_error("expert view size/name mismatch");
+        }
+        gguf_context_ptr metadata(gguf_init_from_buffer(data, size, {true, nullptr}));
+        if (!metadata) return nullptr;
+        params.load_mode = LLAMA_LOAD_MODE_NONE;
+        params.use_extra_bufts = false;
+        params.no_host = true;
+        params.lazy_mode = LLAMA_LAZY_MODE_OFF;
+        std::vector<std::string> splits;
+        return llama_model_load_from_file_impl(metadata.get(), nullptr, nullptr, "", splits, nullptr, params,
+            static_cast<const uint8_t *>(data), size, views, count);
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+        return nullptr;
+    }
+}
+
 // deprecated
 struct llama_model * llama_load_model_from_file(
         const char * path_model,
