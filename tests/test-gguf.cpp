@@ -1696,6 +1696,182 @@ static std::pair<int, int> test_sparse_loss() {
     return {pass, total};
 }
 
+static std::pair<int, int> test_routing_gradients() {
+    int pass = 0, total = 0;
+    for (const auto bounds : {std::pair<float, float>{-1.0f, 1.0f}, {-INFINITY, 1.0f}, {-1.0f, INFINITY}}) {
+        auto * ctx = ggml_init({1024*1024, nullptr, false});
+        auto * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 7);
+        const float values[] = {-2, -1, -0.5f, 0, 0.5f, 1, 2};
+        memcpy(input->data, values, sizeof(values));
+        ggml_set_param(input);
+        auto * loss = ggml_sum(ctx, ggml_clamp(ctx, input, bounds.first, bounds.second));
+        ggml_set_loss(loss);
+        auto * graph = ggml_new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE, true);
+        ggml_build_forward_expand(graph, loss);
+        ggml_build_backward_expand(ctx, graph, nullptr);
+        ggml_graph_reset(graph);
+        bool ok = ggml_graph_compute_with_ctx(ctx, graph, 2) == GGML_STATUS_SUCCESS;
+        const auto * dx = (const float *) ggml_graph_get_grad(graph, input)->data;
+        for (int i = 0; i < 7; ++i) ok &= dx[i] == (values[i] > bounds.first && values[i] < bounds.second ? 1.0f : 0.0f);
+        ++total; pass += ok;
+        fprintf(stdout, "clamp gradients [%g,%g]: %s\n", bounds.first, bounds.second, ok ? "OK" : "FAIL");
+        ggml_free(ctx);
+    }
+    {
+        auto * ctx = ggml_init({4*1024*1024, nullptr, false});
+        auto * owner = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 4, 7, 2, 2);
+        for (int64_t i = 0; i < ggml_nelements(owner); ++i) ((float *) owner->data)[i] = sinf((float) i);
+        ggml_set_param(owner);
+        auto * input = ggml_view_4d(ctx, owner, 3, 5, 2, 2, owner->nb[1], owner->nb[2], owner->nb[3], owner->nb[0] + owner->nb[1]);
+        auto * ids_owner = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 6, 2, 2);
+        auto * ids = ggml_view_3d(ctx, ids_owner, 4, 2, 2, ids_owner->nb[1], ids_owner->nb[2], sizeof(int32_t));
+        const int32_t selected[] = {0, 2, 2, 4};
+        for (int batch = 0; batch < 4; ++batch) {
+            for (int j = 0; j < 4; ++j) ((int32_t *) ids_owner->data)[batch*6 + j + 1] = (selected[j] + batch) % 5;
+        }
+        auto * loss = ggml_sum(ctx, ggml_sqr(ctx, ggml_get_rows(ctx, input, ids)));
+        ggml_set_loss(loss);
+        auto * graph = ggml_new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE, true);
+        ggml_build_forward_expand(graph, loss);
+        ggml_build_backward_expand(ctx, graph, nullptr);
+        ggml_graph_reset(graph);
+        bool ok = ggml_graph_compute_with_ctx(ctx, graph, 1) == GGML_STATUS_SUCCESS;
+        auto * dx = ggml_graph_get_grad(graph, owner);
+        std::vector<float> reference(ggml_nelements(owner), 0.0f);
+        for (int batch = 0; batch < 4; ++batch) for (int j = 0; j < 4; ++j) for (int x = 0; x < 3; ++x) {
+            const int index = batch*28 + ((selected[j] + batch) % 5 + 1)*4 + x + 1;
+            reference[index] += 2.0f*((float *) owner->data)[index];
+        }
+        for (size_t i = 0; i < reference.size(); ++i) ok &= reference[i] == ((float *) dx->data)[i];
+        ok &= ggml_graph_compute_with_ctx(ctx, graph, 4) == GGML_STATUS_SUCCESS;
+        for (size_t i = 0; i < reference.size(); ++i) ok &= reference[i] == ((float *) dx->data)[i];
+        ok &= ggml_graph_get_grad(graph, ids_owner) == nullptr;
+        ++total; pass += ok;
+        fprintf(stdout, "batched gather gradients with strided views and duplicate indices: %s\n", ok ? "OK" : "FAIL");
+        ggml_free(ctx);
+    }
+    {
+        auto * ctx = ggml_init({8*1024*1024, nullptr, false});
+        auto * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 3);
+        auto * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 2);
+        auto * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, 4);
+        auto * router = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 4);
+        auto * up = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 6, 4);
+        auto * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 6, 4);
+        auto * down = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 6, 4, 4);
+        int offset = 0;
+        for (auto * tensor : {input, a, b, up, gate, down}) {
+            for (int64_t i = 0; i < ggml_nelements(tensor); ++i) ((float *) tensor->data)[i] = 0.5f*sinf((float) (++offset)*0.37f);
+        }
+        for (int64_t i = 0; i < ggml_nelements(input); ++i) ((float *) input->data)[i] += 0.75f;
+        for (int i = 0; i < 16; ++i) ((float *) router->data)[i] = 0.2f*(i/4 - 1) + 0.03f*(i%4);
+        ggml_set_param(a);
+        ggml_set_param(b);
+        std::vector<std::vector<uint8_t>> frozen;
+        for (auto * tensor : {router, up, gate, down}) {
+            frozen.emplace_back(ggml_nbytes(tensor));
+            memcpy(frozen.back().data(), tensor->data, frozen.back().size());
+        }
+        auto * adapted = ggml_add(ctx, input, ggml_mul_mat(ctx, b, ggml_mul_mat(ctx, a, input)));
+        auto * logits = ggml_mul_mat(ctx, router, adapted);
+        auto * probabilities = ggml_soft_max(ctx, logits);
+        auto * ids = ggml_argsort_top_k(ctx, probabilities, 2);
+        auto * selected = ggml_get_rows(ctx, ggml_reshape_3d(ctx, probabilities, 1, 4, 3), ids);
+        selected = ggml_reshape_2d(ctx, selected, 2, 3);
+        auto * denominator = ggml_clamp(ctx, ggml_sum_rows(ctx, selected), 6.103515625e-5f, INFINITY);
+        auto * weights = ggml_reshape_3d(ctx, ggml_div(ctx, selected, denominator), 1, 2, 3);
+        auto * x = ggml_reshape_3d(ctx, adapted, 4, 1, 3);
+        auto * hidden = ggml_swiglu_split(ctx, ggml_mul_mat_id(ctx, gate, x, ids), ggml_mul_mat_id(ctx, up, x, ids));
+        auto * experts = ggml_mul(ctx, ggml_mul_mat_id(ctx, down, hidden, ids), weights);
+        auto * output = ggml_add(ctx,
+            ggml_view_2d(ctx, experts, 4, 3, experts->nb[2], 0),
+            ggml_view_2d(ctx, experts, 4, 3, experts->nb[2], experts->nb[1]));
+        auto * loss = ggml_sum(ctx, ggml_sqr(ctx, output));
+        ggml_set_loss(loss);
+        auto * graph = ggml_new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE, true);
+        ggml_build_forward_expand(graph, loss);
+        ggml_build_backward_expand(ctx, graph, nullptr);
+        ggml_graph_reset(graph);
+        bool ok = ggml_graph_compute_with_ctx(ctx, graph, 3) == GGML_STATUS_SUCCESS;
+        float router_gradient = 0;
+        auto * dlogits = ggml_graph_get_grad(graph, logits);
+        for (int64_t i = 0; i < ggml_nelements(dlogits); ++i) router_gradient += fabsf(((float *) dlogits->data)[i]);
+        ok &= router_gradient > 1e-5f;
+        if (router_gradient <= 1e-5f) fprintf(stderr, "routing gradient too small: %g\n", router_gradient);
+        std::vector<std::vector<float>> gradients;
+        for (auto * param : {a, b}) {
+            gradients.emplace_back(ggml_nelements(param));
+            memcpy(gradients.back().data(), ggml_graph_get_grad(graph, param)->data, ggml_nbytes(param));
+        }
+        // Independent double-precision evaluation avoids cancellation in F32 finite differences.
+        auto reference_loss = [&](ggml_tensor * parameter, int64_t element, double perturbation) {
+            auto value = [&](ggml_tensor * t, int64_t i) {
+                return (double) ((float *) t->data)[i] + (t == parameter && i == element ? perturbation : 0.0);
+            };
+            double result = 0;
+            for (int token = 0; token < 3; ++token) {
+                double low_rank[2] = {}, adapted_ref[4] = {}, probabilities_ref[4] = {};
+                for (int r = 0; r < 2; ++r) for (int c = 0; c < 4; ++c) low_rank[r] += value(a, r*4+c)*value(input, token*4+c);
+                for (int c = 0; c < 4; ++c) {
+                    adapted_ref[c] = value(input, token*4+c);
+                    for (int r = 0; r < 2; ++r) adapted_ref[c] += value(b, c*2+r)*low_rank[r];
+                }
+                double sum = 0;
+                for (int e = 0; e < 4; ++e) {
+                    double score = 0;
+                    for (int c = 0; c < 4; ++c) score += value(router, e*4+c)*adapted_ref[c];
+                    probabilities_ref[e] = exp(score);
+                    sum += probabilities_ref[e];
+                }
+                for (double & p : probabilities_ref) p /= sum;
+                int routes[] = {0, 1, 2, 3};
+                std::sort(routes, routes+4, [&](int l, int r) { return probabilities_ref[l] > probabilities_ref[r]; });
+                const double normalizer = std::max(probabilities_ref[routes[0]] + probabilities_ref[routes[1]], 6.103515625e-5);
+                double output_ref[4] = {};
+                for (int j = 0; j < 2; ++j) {
+                    const int e = routes[j];
+                    for (int f = 0; f < 6; ++f) {
+                        double up_ref = 0, gate_ref = 0;
+                        for (int c = 0; c < 4; ++c) {
+                            up_ref += value(up, e*24+f*4+c)*adapted_ref[c];
+                            gate_ref += value(gate, e*24+f*4+c)*adapted_ref[c];
+                        }
+                        const double hidden_ref = up_ref*gate_ref/(1.0+exp(-gate_ref));
+                        for (int c = 0; c < 4; ++c) output_ref[c] += value(down, e*24+c*6+f)*hidden_ref*probabilities_ref[e]/normalizer;
+                    }
+                }
+                for (double v : output_ref) result += v*v;
+            }
+            return result;
+        };
+        ok &= fabs(reference_loss(nullptr, 0, 0) - *(float *) loss->data) < 1e-6;
+        int parameter = 0;
+        for (auto * param : {a, b}) {
+            for (int64_t i = 0; i < ggml_nelements(param); ++i) {
+                const double eps = 1e-4;
+                const double numerical = (reference_loss(param, i, eps) - reference_loss(param, i, -eps))/(2*eps);
+                const float analytical = gradients[parameter][i];
+                if (fabs(numerical - analytical) >= 1e-6) {
+                    fprintf(stderr, "routing derivative parameter=%d element=%zu: numerical=%g analytical=%g\n", parameter, (size_t) i, numerical, analytical);
+                    ok = false;
+                }
+            }
+            ++parameter;
+        }
+        int tensor_index = 0;
+        for (auto * tensor : {router, up, gate, down}) {
+            ok &= ggml_graph_get_grad(graph, tensor) == nullptr;
+            ok &= memcmp(frozen[tensor_index].data(), tensor->data, ggml_nbytes(tensor)) == 0;
+            ++tensor_index;
+        }
+        ok &= ggml_graph_get_grad(graph, ids) == nullptr;
+        ++total; pass += ok;
+        fprintf(stdout, "adapter gradients through frozen experts and normalized routing probabilities: %s\n", ok ? "OK" : "FAIL");
+        ggml_free(ctx);
+    }
+    return {pass, total};
+}
+
 static std::pair<int, int> test_attention_training() {
     int pass = 0, total = 0;
     for (int32_t n_past : {-1, 0, 2}) {
@@ -2026,6 +2202,11 @@ int main(int argc, char ** argv) {
     }
     {
         auto result = test_quantized_expert_gradients();
+        npass += result.first;
+        ntest += result.second;
+    }
+    {
+        auto result = test_routing_gradients();
         npass += result.first;
         ntest += result.second;
     }

@@ -3976,11 +3976,42 @@ struct ggml_tensor * ggml_get_rows(
 
 // ggml_get_rows_back
 
+static void ggml_get_rows_back_batched_compute(struct ggml_tensor * dst, int ith, int nth, void * userdata) {
+    const struct ggml_tensor * grad = dst->src[0];
+    const struct ggml_tensor * ids = dst->src[1];
+    for (int64_t row = ith; row < ggml_nrows(dst); row += nth) {
+        const int64_t i1 = row % dst->ne[1];
+        const int64_t i2 = (row / dst->ne[1]) % dst->ne[2];
+        const int64_t i3 = row / (dst->ne[1] * dst->ne[2]);
+        float * out = (float *) ((char *) dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
+        memset(out, 0, dst->ne[0]*sizeof(float));
+        for (int64_t j = 0; j < ids->ne[0]; ++j) {
+            const int32_t id = *(const int32_t *) ((const char *) ids->data + j*ids->nb[0] + i2*ids->nb[1] + i3*ids->nb[2]);
+            GGML_ASSERT(id >= 0 && id < dst->ne[1]);
+            if (id != i1) continue;
+            for (int64_t x = 0; x < dst->ne[0]; ++x) {
+                out[x] += *(const float *) ((const char *) grad->data + x*grad->nb[0] + j*grad->nb[1] + i2*grad->nb[2] + i3*grad->nb[3]);
+            }
+        }
+    }
+    GGML_UNUSED(userdata);
+}
+
 struct ggml_tensor * ggml_get_rows_back(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
         struct ggml_tensor  * b,
         struct ggml_tensor  * c) {
+    if (!ggml_is_matrix(c) || !ggml_is_vector(b)) {
+        GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_I32);
+        GGML_ASSERT(a->ne[0] == c->ne[0] && a->ne[1] == b->ne[0]);
+        GGML_ASSERT(a->ne[2] == c->ne[2] && a->ne[2] == b->ne[1]);
+        GGML_ASSERT(a->ne[3] == c->ne[3] && a->ne[3] == b->ne[2] && b->ne[3] == 1);
+        // Each task owns a destination row, including duplicate indices in each batch.
+        struct ggml_tensor * args[] = {a, b};
+        return ggml_custom_4d(ctx, GGML_TYPE_F32, c->ne[0], c->ne[1], c->ne[2], c->ne[3],
+                args, 2, ggml_get_rows_back_batched_compute, GGML_N_TASKS_MAX, NULL);
+    }
     GGML_ASSERT(ggml_is_matrix(a) && ggml_is_vector(b) && b->type == GGML_TYPE_I32);
     GGML_ASSERT(ggml_is_matrix(c) && (a->ne[0] == c->ne[0]));
 
@@ -7225,7 +7256,11 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_div(ctx, grad, src1));
             }
             if (src1_needs_grads) {
-                ggml_sub_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, grad, ggml_div(ctx, tensor, src1)));
+                struct ggml_tensor * tmp = ggml_mul(ctx, grad, ggml_div(ctx, tensor, src1));
+                if (!ggml_are_same_shape(src0, src1)) {
+                    tmp = ggml_repeat_back(ctx, tmp, src1);
+                }
+                ggml_sub_or_set(ctx, cgraph, isrc1, tmp);
             }
         } break;
         case GGML_OP_SQR: {
@@ -7514,6 +7549,16 @@ static void ggml_compute_backward(
         case GGML_OP_TRANSPOSE: {
             if (src0_needs_grads) {
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_transpose(ctx, grad));
+            }
+        } break;
+        case GGML_OP_CLAMP: {
+            if (src0_needs_grads) {
+                float bounds[2];
+                memcpy(bounds, tensor->op_params, sizeof(bounds));
+                // Use the zero subgradient at either boundary.
+                struct ggml_tensor * above = ggml_step(ctx, ggml_scale_bias(ctx, src0, 1.0f, -bounds[0]));
+                struct ggml_tensor * below = ggml_step(ctx, ggml_scale_bias(ctx, src0, -1.0f, bounds[1]));
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad, ggml_mul(ctx, above, below)));
             }
         } break;
         case GGML_OP_GET_ROWS: {
