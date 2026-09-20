@@ -2512,6 +2512,19 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // CPU F32 training attention with first-order gradients for q, k and v.
+    // Shapes and GQA head mapping match flash_attn_ext; rows may have non-contiguous strides.
+    // n_past >= 0 enables causal attention to keys <= query_index + n_past; -1 disables it.
+    // Keeps per-query softmax statistics and recomputes scores in backward, without a quadratic mask or score tensor.
+    // No sinks, attention bias, dropout or logit softcap. Output is contiguous [n_embd_v, n_head, n_batch, ne3].
+    GGML_API struct ggml_tensor * ggml_attention_training(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            float                 scale,
+            int32_t               n_past);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,

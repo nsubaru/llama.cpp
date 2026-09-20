@@ -1696,6 +1696,97 @@ static std::pair<int, int> test_sparse_loss() {
     return {pass, total};
 }
 
+static std::pair<int, int> test_attention_training() {
+    int pass = 0, total = 0;
+    for (int32_t n_past : {-1, 0, 2}) {
+        auto * ctx = ggml_init({8*1024*1024, nullptr, false});
+        auto * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 4, 3, 4, 2);
+        auto * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 4, 5, 2, 2);
+        auto * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 3, 5, 2, 2);
+        for (auto * input : {q, k, v}) {
+            for (int64_t i = 0; i < ggml_nelements(input); ++i) ((float *) input->data)[i] = sinf((float) i + input->ne[0]);
+            ggml_set_param(input);
+        }
+        auto * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 5, 3);
+        for (int query = 0; query < 3; ++query) {
+            for (int key = 0; key < 5; ++key) ((float *) mask->data)[query*5 + key] = n_past < 0 || key <= query + n_past ? 0.0f : -INFINITY;
+        }
+        auto expand_heads = [&](ggml_tensor * input) {
+            auto * grouped = ggml_reshape_4d(ctx, input, input->ne[0], input->ne[1], 1, input->ne[2]*input->ne[3]);
+            auto * repeated = ggml_repeat_4d(ctx, grouped, input->ne[0], input->ne[1], q->ne[2]/input->ne[2], grouped->ne[3]);
+            return ggml_reshape_4d(ctx, repeated, input->ne[0], input->ne[1], q->ne[2], q->ne[3]);
+        };
+        auto * scores = ggml_mul_mat(ctx, expand_heads(k), q);
+        auto * probabilities = ggml_soft_max_ext(ctx, scores, mask, 0.5f, 0.0f);
+        auto * dense = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, expand_heads(v))), probabilities);
+        dense = ggml_cont(ctx, ggml_permute(ctx, dense, 0, 2, 1, 3));
+        auto * bounded = ggml_attention_training(ctx, q, k, v, 0.5f, n_past);
+        auto * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, dense);
+        ggml_build_forward_expand(graph, bounded);
+        bool ok = ggml_graph_compute_with_ctx(ctx, graph, 1) == GGML_STATUS_SUCCESS;
+        std::vector<float> single(ggml_nelements(bounded));
+        memcpy(single.data(), bounded->data, ggml_nbytes(bounded));
+        for (size_t i = 0; i < single.size(); ++i) ok &= fabsf(single[i] - ((float *) dense->data)[i]) < 1e-6f;
+        ok &= ggml_graph_compute_with_ctx(ctx, graph, 3) == GGML_STATUS_SUCCESS;
+        ok &= memcmp(single.data(), bounded->data, ggml_nbytes(bounded)) == 0;
+        auto backward = [&](ggml_tensor * output) {
+            auto * loss = ggml_sum(ctx, ggml_sqr(ctx, output));
+            ggml_set_loss(loss);
+            auto * back = ggml_new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE, true);
+            ggml_build_forward_expand(back, loss);
+            ggml_build_backward_expand(ctx, back, nullptr);
+            ggml_graph_reset(back);
+            ok &= ggml_graph_compute_with_ctx(ctx, back, 3) == GGML_STATUS_SUCCESS;
+            return back;
+        };
+        auto * dense_back = backward(dense);
+        auto * bounded_back = backward(bounded);
+        for (auto * input : {q, k, v}) {
+            const auto * reference = (const float *) ggml_graph_get_grad(dense_back, input)->data;
+            const auto * actual = (const float *) ggml_graph_get_grad(bounded_back, input)->data;
+            for (int64_t i = 0; i < ggml_nelements(input); ++i) ok &= fabsf(reference[i] - actual[i]) < 2e-6f;
+        }
+        ++total; pass += ok;
+        fprintf(stdout, "training attention dense reference n_past=%d: %s\n", n_past, ok ? "OK" : "FAIL");
+        ggml_free(ctx);
+    }
+    {
+        // A dense two-head score tensor alone needs 32 MiB at this sequence length.
+        const int64_t tokens = 2048;
+        auto * ctx = ggml_init({8*1024*1024, nullptr, false});
+        auto * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 4, tokens, 2, 1);
+        auto * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 4, tokens, 1, 1);
+        auto * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 3, tokens, 1, 1);
+        for (auto * input : {q, k, v}) {
+            ggml_set_f32(input, 0.25f);
+            ggml_set_param(input);
+        }
+        auto * output = ggml_attention_training(ctx, q, k, v, 0.5f, 0);
+        auto * loss = ggml_sum(ctx, output);
+        ggml_set_loss(loss);
+        auto * graph = ggml_new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE, true);
+        ggml_build_forward_expand(graph, loss);
+        ggml_build_backward_expand(ctx, graph, nullptr);
+        ggml_graph_reset(graph);
+        bool ok = ggml_graph_compute_with_ctx(ctx, graph, 3) == GGML_STATUS_SUCCESS;
+        ok &= *(float *) loss->data == (float) (tokens*2*3)*0.25f;
+        const auto * dv = (const float *) ggml_graph_get_grad(graph, v)->data;
+        double first = 0.0;
+        for (int64_t i = 1; i <= tokens; ++i) first += 2.0/i;
+        ok &= fabs(dv[0] - first) < 1e-4;
+        ok &= fabsf(dv[3*(tokens - 1)] - 2.0f/tokens) < 1e-6f;
+        for (auto * input : {q, k}) {
+            const auto * gradient = (const float *) ggml_graph_get_grad(graph, input)->data;
+            for (int64_t i = 0; i < ggml_nelements(input); ++i) ok &= fabsf(gradient[i]) < 1e-6f;
+        }
+        ++total; pass += ok;
+        fprintf(stdout, "training attention 2048 tokens with 8 MiB arena: %s\n", ok ? "OK" : "FAIL");
+        ggml_free(ctx);
+    }
+    return {pass, total};
+}
+
 static std::pair<int, int> test_l2_norm_gradients() {
     int pass = 0;
     for (bool clamped : {false, true}) {
@@ -1918,6 +2009,11 @@ int main(int argc, char ** argv) {
 
     int npass = 0;
     int ntest = 0;
+    {
+        auto result = test_attention_training();
+        npass += result.first;
+        ntest += result.second;
+    }
     {
         auto result = test_l2_norm_gradients();
         npass += result.first;

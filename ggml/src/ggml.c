@@ -6239,6 +6239,155 @@ struct ggml_tensor * ggml_custom_inplace(
 
     return result;
 }
+// ggml_attention_training
+
+struct ggml_attention_training_params {
+    float scale;
+    int32_t n_past;
+    int32_t gradient;
+};
+
+static struct ggml_attention_training_params ggml_attention_training_get_params(const struct ggml_tensor * tensor) {
+    struct ggml_attention_training_params params;
+    memcpy(&params, (const char *) tensor->op_params + sizeof(struct ggml_custom_op_params), sizeof(params));
+    return params;
+}
+
+static void ggml_attention_training_set_params(struct ggml_tensor * tensor, struct ggml_attention_training_params params) {
+    GGML_ASSERT(sizeof(struct ggml_custom_op_params) + sizeof(params) <= GGML_MAX_OP_PARAMS);
+    memcpy((char *) tensor->op_params + sizeof(struct ggml_custom_op_params), &params, sizeof(params));
+}
+
+static const float * ggml_attention_training_row(const struct ggml_tensor * tensor, int64_t i1, int64_t i2, int64_t i3) {
+    return (const float *) ((const char *) tensor->data + i1*tensor->nb[1] + i2*tensor->nb[2] + i3*tensor->nb[3]);
+}
+
+static float ggml_attention_training_dot(const float * a, const float * b, int64_t n) {
+    double sum = 0.0;
+    for (int64_t i = 0; i < n; ++i) sum += (double) a[i]*b[i];
+    return (float) sum;
+}
+
+static int64_t ggml_attention_training_keys(const struct ggml_tensor * k, int64_t query, int32_t n_past) {
+    return n_past < 0 ? k->ne[1] : MIN(k->ne[1], query + n_past + 1);
+}
+
+static void ggml_attention_training_compute(struct ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(userdata);
+    const struct ggml_tensor * q = dst->src[0];
+    const struct ggml_tensor * k = dst->src[1];
+    const struct ggml_tensor * v = dst->src[2];
+    const struct ggml_attention_training_params params = ggml_attention_training_get_params(dst);
+    const int64_t repeat = q->ne[2]/k->ne[2];
+    for (int64_t row = ith; row < ggml_nrows(dst); row += nth) {
+        const int64_t head = row % q->ne[2];
+        const int64_t query = row/q->ne[2] % q->ne[1];
+        const int64_t batch = row/(q->ne[2]*q->ne[1]);
+        const float * pq = ggml_attention_training_row(q, query, head, batch);
+        float * output = (float *) dst->data + row*dst->ne[0];
+        memset(output, 0, v->ne[0]*sizeof(float));
+        float maximum = -INFINITY;
+        float denominator = 0.0f;
+        const int64_t keys = ggml_attention_training_keys(k, query, params.n_past);
+        for (int64_t key = 0; key < keys; ++key) {
+            const float * pk = ggml_attention_training_row(k, key, head/repeat, batch);
+            const float * pv = ggml_attention_training_row(v, key, head/repeat, batch);
+            const float score = params.scale*ggml_attention_training_dot(pq, pk, q->ne[0]);
+            const float next_maximum = fmaxf(maximum, score);
+            const float old_weight = expf(maximum - next_maximum);
+            const float weight = expf(score - next_maximum);
+            for (int64_t d = 0; d < v->ne[0]; ++d) output[d] = output[d]*old_weight + weight*pv[d];
+            denominator = denominator*old_weight + weight;
+            maximum = next_maximum;
+        }
+        for (int64_t d = 0; d < v->ne[0]; ++d) output[d] /= denominator;
+        output[v->ne[0]] = maximum;
+        output[v->ne[0] + 1] = denominator;
+    }
+}
+
+static void ggml_attention_training_back_compute(struct ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(userdata);
+    const struct ggml_tensor * q = dst->src[0];
+    const struct ggml_tensor * k = dst->src[1];
+    const struct ggml_tensor * v = dst->src[2];
+    const struct ggml_tensor * forward = dst->src[3];
+    const struct ggml_tensor * grad = dst->src[4];
+    const struct ggml_attention_training_params params = ggml_attention_training_get_params(dst);
+    const int64_t repeat = q->ne[2]/k->ne[2];
+    for (int64_t row = ith; row < ggml_nrows(dst); row += nth) {
+        const int64_t position = row % dst->ne[1];
+        const int64_t head = row/dst->ne[1] % dst->ne[2];
+        const int64_t batch = row/(dst->ne[1]*dst->ne[2]);
+        float * output = (float *) dst->data + row*dst->ne[0];
+        memset(output, 0, dst->ne[0]*sizeof(float));
+        const int64_t head_begin = params.gradient == 0 ? head : head*repeat;
+        const int64_t head_end = params.gradient == 0 ? head + 1 : (head + 1)*repeat;
+        const int64_t query_begin = params.gradient == 0 ? position : 0;
+        const int64_t query_end = params.gradient == 0 ? position + 1 : q->ne[1];
+        for (int64_t h = head_begin; h < head_end; ++h) {
+            for (int64_t query = query_begin; query < query_end; ++query) {
+                const int64_t keys = ggml_attention_training_keys(k, query, params.n_past);
+                if (params.gradient != 0 && position >= keys) continue;
+                const float * pq = ggml_attention_training_row(q, query, h, batch);
+                const float * pf = ggml_attention_training_row(forward, h, query, batch);
+                const float * dy = ggml_attention_training_row(grad, h, query, batch);
+                const float correction = ggml_attention_training_dot(pf, dy, v->ne[0]);
+                const int64_t key_begin = params.gradient == 0 ? 0 : position;
+                const int64_t key_end = params.gradient == 0 ? keys : position + 1;
+                for (int64_t key = key_begin; key < key_end; ++key) {
+                    const float * pk = ggml_attention_training_row(k, key, h/repeat, batch);
+                    const float * pv = ggml_attention_training_row(v, key, h/repeat, batch);
+                    const float score = params.scale*ggml_attention_training_dot(pq, pk, q->ne[0]);
+                    const float probability = expf(score - pf[v->ne[0]])/pf[v->ne[0] + 1];
+                    if (params.gradient == 2) {
+                        for (int64_t d = 0; d < v->ne[0]; ++d) output[d] += probability*dy[d];
+                    } else {
+                        const float ds = params.scale*probability*(ggml_attention_training_dot(pv, dy, v->ne[0]) - correction);
+                        const float * factor = params.gradient == 0 ? pk : pq;
+                        for (int64_t d = 0; d < q->ne[0]; ++d) output[d] += ds*factor[d];
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct ggml_tensor * ggml_attention_training(
+        struct ggml_context * ctx,
+        struct ggml_tensor * q,
+        struct ggml_tensor * k,
+        struct ggml_tensor * v,
+        float scale,
+        int32_t n_past) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->nb[0] == sizeof(float) && k->nb[0] == sizeof(float) && v->nb[0] == sizeof(float));
+    GGML_ASSERT(q->ne[0] == k->ne[0] && k->ne[1] == v->ne[1] && k->ne[2] == v->ne[2]);
+    GGML_ASSERT(q->ne[3] == k->ne[3] && q->ne[3] == v->ne[3]);
+    GGML_ASSERT(ggml_nelements(q) > 0 && ggml_nelements(k) > 0 && ggml_nelements(v) > 0);
+    GGML_ASSERT(q->ne[2] % k->ne[2] == 0);
+    GGML_ASSERT(isfinite(scale) && scale > 0.0f && n_past >= -1);
+    struct ggml_tensor * args[] = { q, k, v };
+    struct ggml_tensor * packed = ggml_custom_4d(ctx, GGML_TYPE_F32, v->ne[0] + 2, q->ne[2], q->ne[1], q->ne[3],
+        args, 3, ggml_attention_training_compute, GGML_N_TASKS_MAX, NULL);
+    const struct ggml_attention_training_params params = { scale, n_past, -1 };
+    ggml_attention_training_set_params(packed, params);
+    return ggml_cont(ctx, ggml_view_4d(ctx, packed, v->ne[0], q->ne[2], q->ne[1], q->ne[3],
+        packed->nb[1], packed->nb[2], packed->nb[3], 0));
+}
+
+static struct ggml_tensor * ggml_attention_training_back(
+        struct ggml_context * ctx, struct ggml_tensor * forward, struct ggml_tensor * grad, int32_t index) {
+    struct ggml_tensor * input = forward->src[index];
+    struct ggml_tensor * args[] = { forward->src[0], forward->src[1], forward->src[2], forward, grad };
+    struct ggml_tensor * result = ggml_custom_4d(ctx, GGML_TYPE_F32, input->ne[0], input->ne[1], input->ne[2], input->ne[3],
+        args, 5, ggml_attention_training_back_compute, GGML_N_TASKS_MAX, NULL);
+    struct ggml_attention_training_params params = ggml_attention_training_get_params(forward);
+    params.gradient = index;
+    ggml_attention_training_set_params(result, params);
+    return result;
+}
+
 // ggml_cross_entropy_loss_sparse
 
 static int64_t ggml_sparse_label_count(const struct ggml_tensor * logits, const struct ggml_tensor * labels) {
@@ -7515,6 +7664,12 @@ static void ggml_compute_backward(
         case GGML_OP_CUSTOM: {
             struct ggml_custom_op_params params;
             memcpy(&params, tensor->op_params, sizeof(params));
+            if (params.fun == ggml_attention_training_compute) {
+                if (src0_needs_grads) ggml_add_or_set(ctx, cgraph, isrc0, ggml_attention_training_back(ctx, tensor, grad, 0));
+                if (src1_needs_grads) ggml_add_or_set(ctx, cgraph, isrc1, ggml_attention_training_back(ctx, tensor, grad, 1));
+                if (src2_needs_grads) ggml_add_or_set(ctx, cgraph, isrc2, ggml_attention_training_back(ctx, tensor, grad, 2));
+                break;
+            }
             GGML_ASSERT(params.fun == ggml_sparse_loss_compute && "unsupported custom backward operation");
             GGML_ASSERT(!src1_needs_grads && "sparse labels are discrete");
             if (src0_needs_grads) {

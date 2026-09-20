@@ -7754,6 +7754,45 @@ struct test_leaky_relu : public test_case {
     }
 };
 
+struct test_attention_training : public test_case {
+    const int32_t n_past;
+    const bool permuted;
+
+    test_attention_training(int32_t n_past, bool permuted) : n_past(n_past), permuted(permuted) {}
+
+    std::string op_desc(ggml_tensor * tensor) override {
+        GGML_UNUSED(tensor);
+        return "ATTENTION_TRAINING";
+    }
+
+    std::string vars() override { return VARS_TO_STR2(n_past, permuted); }
+    bool grad_precise() override { return true; }
+    double max_maa_err() override { return 1e-6; }
+
+    double gradient_error(const std::vector<float> & numeric, const std::vector<float> & analytic,
+                          const std::vector<float> & expected) override {
+        GGML_UNUSED(expected);
+        // F32 scalar loss differencing gives unstable relative errors near zero.
+        double error = 0.0;
+        for (size_t i = 0; i < numeric.size(); ++i) error = std::max(error, (double) fabsf(numeric[i] - analytic[i]));
+        return error;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto input = [&](int64_t width, int64_t tokens, int64_t heads) {
+            auto * base = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, width,
+                permuted ? heads : tokens, permuted ? tokens : heads, 2);
+            ggml_set_param(base);
+            return permuted ? ggml_permute(ctx, base, 0, 2, 1, 3) : base;
+        };
+        auto * q = input(4, 3, 4);
+        auto * k = input(4, 5, 2);
+        auto * v = input(3, 5, 2);
+        auto * output = ggml_attention_training(ctx, q, k, v, 0.5f, n_past);
+        return ggml_scale(ctx, output, 1.0f/ggml_nelements(output));
+    }
+};
+
 // GGML_OP_FLASH_ATTN_EXT
 struct test_flash_attn_ext : public test_case {
     const int64_t hsk; // K head size
@@ -10799,6 +10838,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     }
                 }
             }
+        }
+    }
+
+    for (int32_t n_past : {-1, 0, 2}) {
+        for (bool permuted : {false, true}) {
+            test_cases.emplace_back(new test_attention_training(n_past, permuted));
         }
     }
 
