@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-    #define GGML_BACKEND_API_VERSION 2
+    #define GGML_BACKEND_API_VERSION 3
 
     //
     // Backend buffer type
@@ -72,7 +72,12 @@ extern "C" {
         void * context;
         size_t size;
         enum ggml_backend_buffer_usage usage;
+        bool borrowed_read_only;
+        bool borrowed_storage;
     };
+
+    GGML_API void ggml_backend_buffer_rebind(ggml_backend_buffer_t buffer,
+        ggml_backend_buffer_type_t buft, void (*free_buffer)(ggml_backend_buffer_t));
 
     GGML_API ggml_backend_buffer_t ggml_backend_buffer_init(
                    ggml_backend_buffer_type_t buft,

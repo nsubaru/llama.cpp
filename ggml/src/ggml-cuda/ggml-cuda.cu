@@ -414,6 +414,30 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 
 // #define DEBUG_CUDA_MALLOC
 
+void ggml_cuda_reserve_runtime_memory(int device, size_t size) {
+    if (!ggml_backend_reserve_runtime_memory(ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device), size)) {
+        throw std::bad_alloc();
+    }
+}
+
+void ggml_cuda_release_runtime_memory(int device, size_t size) {
+    ggml_backend_release_runtime_memory(ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device), size);
+    ggml_backend_account_allocation(GGML_BACKEND_ALLOCATION_DEVICE, size, true);
+}
+
+void * ggml_cuda_allocate_runtime_memory(int device, size_t size) {
+    ggml_cuda_reserve_runtime_memory(device, size);
+    void * ptr = nullptr;
+    const auto error = ggml_cuda_device_malloc(&ptr, size, device);
+    if (error != cudaSuccess) {
+        ggml_backend_release_runtime_memory(ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device), size);
+        (void)cudaGetLastError();
+        throw std::bad_alloc();
+    }
+    ggml_backend_account_allocation(GGML_BACKEND_ALLOCATION_DEVICE, size, false);
+    return ptr;
+}
+
 // buffer pool for cuda (legacy)
 struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     static const int MAX_BUFFERS = 256;
@@ -442,6 +466,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             ggml_cuda_buffer & b = buffer_pool[i];
             if (b.ptr != nullptr) {
                 CUDA_CHECK(cudaFree(b.ptr));
+                ggml_cuda_release_runtime_memory(device, b.size);
                 pool_size -= b.size;
                 b.ptr  = nullptr;
                 b.size = 0;
@@ -491,6 +516,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         size_t look_ahead_size = (size_t) (1.05 * size);
         look_ahead_size = 256 * ((look_ahead_size + 255)/256);
         ggml_cuda_set_device(device);
+        ggml_cuda_reserve_runtime_memory(device, look_ahead_size);
         cudaError_t err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
         if (err == cudaErrorMemoryAllocation) {
             (void)cudaGetLastError();
@@ -504,7 +530,12 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
                 GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: retry succeeded\n", device);
             }
         }
-        CUDA_CHECK(err);
+        if (err != cudaSuccess) {
+            ggml_backend_release_runtime_memory(ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device), look_ahead_size);
+            (void)cudaGetLastError();
+            throw std::bad_alloc();
+        }
+        ggml_backend_account_allocation(GGML_BACKEND_ALLOCATION_DEVICE, look_ahead_size, false);
         *actual_size = look_ahead_size;
         pool_size += look_ahead_size;
 #ifdef DEBUG_CUDA_MALLOC
@@ -526,6 +557,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         GGML_LOG_DEBUG(GGML_CUDA_NAME " buffer pool full, increase MAX_CUDA_BUFFERS\n");
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(ptr));
+        ggml_cuda_release_runtime_memory(device, size);
         pool_size -= size;
     }
 };
@@ -562,6 +594,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             CU_CHECK(cuMemUnmap(pool_addr, pool_size));
 #endif
             CU_CHECK(cuMemAddressFree(pool_addr, CUDA_POOL_VMM_MAX_SIZE));
+            ggml_cuda_release_runtime_memory(device, pool_size);
         }
     }
 
@@ -585,7 +618,13 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             prop.location.id = physical_device;
             CUmemGenericAllocationHandle handle;
-            CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
+            ggml_cuda_reserve_runtime_memory(device, reserve_size);
+            const auto create_error = cuMemCreate(&handle, reserve_size, &prop, 0);
+            if (create_error != CUDA_SUCCESS) {
+                ggml_backend_release_runtime_memory(ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device), reserve_size);
+                throw std::bad_alloc();
+            }
+            ggml_backend_account_allocation(GGML_BACKEND_ALLOCATION_DEVICE, reserve_size, false);
 
             // reserve virtual address space (if not already reserved)
             if (pool_addr == 0) {
@@ -715,6 +754,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
             }
             if (cublas_workspaces[i][j] != nullptr) {
                 CUDA_CHECK(cudaFree(cublas_workspaces[i][j]));
+                ggml_cuda_release_runtime_memory(i, cublas_workspace_sizes[i]);
             }
         }
     }
@@ -728,13 +768,15 @@ struct ggml_backend_cuda_buffer_context {
     void * dev_ptr = nullptr;
     std::string name;
 
-    ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
-        device(device), dev_ptr(dev_ptr),
+    size_t backing_size;
+    ggml_backend_cuda_buffer_context(int device, void * dev_ptr, size_t backing_size) :
+        device(device), dev_ptr(dev_ptr), backing_size(backing_size),
         name(GGML_CUDA_NAME + std::to_string(device)) {
     }
 
     ~ggml_backend_cuda_buffer_context() {
         CUDA_CHECK(cudaFree(dev_ptr));
+        ggml_backend_account_allocation(GGML_BACKEND_ALLOCATION_DEVICE, backing_size, true);
     }
 };
 
@@ -894,9 +936,19 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
         return nullptr;
     }
 
-    ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
-
-    return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+    ggml_backend_account_allocation(GGML_BACKEND_ALLOCATION_DEVICE, size, false);
+    ggml_backend_cuda_buffer_context * ctx = nullptr;
+    try {
+        ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr, size);
+        return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+    } catch (...) {
+        if (ctx) delete ctx;
+        else {
+            CUDA_CHECK(cudaFree(dev_ptr));
+            ggml_backend_account_allocation(GGML_BACKEND_ALLOCATION_DEVICE, size, true);
+        }
+        return nullptr;
+    }
 }
 
 static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
@@ -1271,6 +1323,7 @@ static bool ggml_backend_buft_is_cuda_host(ggml_backend_buffer_type_t buft) {
 
 static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     CUDA_CHECK(cudaFreeHost(buffer->context));
+    ggml_backend_account_allocation(GGML_BACKEND_ALLOCATION_PINNED, buffer->size, true);
 }
 
 static void * ggml_cuda_host_malloc(size_t size) {
@@ -1299,9 +1352,16 @@ static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggm
         return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
     }
 
-    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
-    buffer->buft = buft;
-    buffer->iface.free_buffer = ggml_backend_cuda_host_buffer_free_buffer;
+    ggml_backend_account_allocation(GGML_BACKEND_ALLOCATION_PINNED, size, false);
+    ggml_backend_buffer_t buffer = nullptr;
+    try {
+        buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+        ggml_backend_buffer_rebind(buffer, buft, ggml_backend_cuda_host_buffer_free_buffer);
+    } catch (...) {
+        CUDA_CHECK(cudaFreeHost(ptr));
+        ggml_backend_account_allocation(GGML_BACKEND_ALLOCATION_PINNED, size, true);
+        throw;
+    }
 
     return buffer;
 }
@@ -4471,7 +4531,29 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
-    ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    try {
+        ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    } catch (const std::bad_alloc &) {
+        // A denied workspace expansion must unwind capture and the global destruction gate.
+        cuda_ctx->curr_stream_no = 0;
+#ifdef USE_CUDA_GRAPH
+        if (use_cuda_graph && cuda_graph_update_required) {
+            cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+            (void)cudaStreamIsCapturing(cuda_ctx->stream(), &status);
+            if (status != cudaStreamCaptureStatusNone) {
+                cudaGraph_t abandoned = nullptr;
+                (void)cudaStreamEndCapture(cuda_ctx->stream(), &abandoned);
+                if (abandoned) (void)cudaGraphDestroy(abandoned);
+                std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+                if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) ggml_cuda_lock_cv.notify_all();
+            }
+            graph->warmup_complete = false;
+        }
+#endif
+        (void)cudaDeviceSynchronize();
+        GGML_LOG_ERROR("%s: workspace allocation or admission failed\n", __func__);
+        return GGML_STATUS_ALLOC_FAILED;
+    }
 
     return GGML_STATUS_SUCCESS;
 }
@@ -4836,6 +4918,10 @@ void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * tot
 }
 
 bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
+    if (ggml_backend_is_borrowed_range(buffer, size)) {
+        GGML_LOG_ERROR("%s: refusing to pin borrowed immutable weights\n", __func__);
+        return false;
+    }
     if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr) {
         return false;
     }

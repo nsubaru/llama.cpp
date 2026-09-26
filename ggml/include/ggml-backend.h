@@ -67,6 +67,48 @@ extern "C" {
     GGML_API ggml_backend_buffer_type_t     ggml_backend_buffer_get_type      (ggml_backend_buffer_t buffer);
     GGML_API void                           ggml_backend_buffer_reset         (ggml_backend_buffer_t buffer);
 
+    // Borrowed immutable weights cannot be cloned by scheduler transfers or written through tensor views.
+    // Marks externally owned storage for diagnostics without forbidding explicitly allowed transfers.
+    GGML_API void ggml_backend_buffer_set_borrowed_storage(ggml_backend_buffer_t buffer);
+    GGML_API void ggml_backend_buffer_set_borrowed_read_only(ggml_backend_buffer_t buffer);
+    GGML_API bool ggml_backend_tensor_is_borrowed_read_only(const struct ggml_tensor * tensor);
+    // Tests overlap without accessing payload pages. Used to reject implicit host registration.
+    GGML_API bool ggml_backend_is_borrowed_range(const void * data, size_t size);
+
+    // Current represented buffer bytes. Excludes backend pools, driver allocations and CPU kernel scratch.
+    // Model bytes are a subset of owned bytes. Aggregate wrappers are excluded.
+    struct ggml_backend_buffer_diagnostics {
+        uint64_t borrowed_bytes;
+        uint64_t owned_host_bytes;
+        uint64_t owned_pinned_bytes;
+        uint64_t owned_device_bytes;
+        uint64_t owned_model_bytes;
+        uint64_t protected_copy_attempts;
+    };
+    GGML_API void ggml_backend_get_buffer_diagnostics(struct ggml_backend_buffer_diagnostics * diagnostics);
+
+    // Backing obtained directly from an allocator, including retained workspace. CUDA is the
+    // supported device counter producer; other backends must not infer support from a zero.
+    enum ggml_backend_allocation_kind {
+        GGML_BACKEND_ALLOCATION_DEVICE,
+        GGML_BACKEND_ALLOCATION_PINNED,
+        GGML_BACKEND_ALLOCATION_CPU_SCRATCH,
+        GGML_BACKEND_ALLOCATION_COUNT
+    };
+    struct ggml_backend_allocation_diagnostics {
+        uint64_t current[GGML_BACKEND_ALLOCATION_COUNT];
+        uint64_t peak[GGML_BACKEND_ALLOCATION_COUNT];
+        uint64_t runtime_pool_bytes; // subset of device bytes, not additional backing
+        uint64_t runtime_pool_peak_bytes;
+    };
+    GGML_API void ggml_backend_get_allocation_diagnostics(struct ggml_backend_allocation_diagnostics * diagnostics);
+    GGML_API void ggml_backend_account_allocation(enum ggml_backend_allocation_kind kind, size_t bytes, bool release);
+    // Device-wide pool/cuBLAS cap, shared by every context in this process. Default is unlimited.
+    // Reservations cover retained backing and in-flight growth, never individual suballocations.
+    GGML_API bool ggml_backend_set_runtime_memory_limit(ggml_backend_dev_t device, uint64_t bytes);
+    GGML_API bool ggml_backend_reserve_runtime_memory(ggml_backend_dev_t device, size_t bytes);
+    GGML_API void ggml_backend_release_runtime_memory(ggml_backend_dev_t device, size_t bytes);
+
     // tensor copy between different backends
     GGML_API void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor * dst);
 
@@ -320,11 +362,14 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
 
     // Initialize backend buffers from a measure graph
-    GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
+    GGML_API bool                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success
 
     GGML_API int                  ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched);
     GGML_API ggml_backend_t       ggml_backend_sched_get_backend(ggml_backend_sched_t sched, int i);
+
+    // Peak CPU scratch for the last split graph, without allocating a work buffer.
+    GGML_API size_t ggml_backend_sched_get_cpu_work_size(ggml_backend_sched_t sched, int n_threads);
 
     // Get the number of splits of the last graph
     GGML_API int                  ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched);
@@ -337,7 +382,7 @@ extern "C" {
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
 
     // Split graph without allocating it
-    GGML_API void                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+    GGML_API bool                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
 
     // Allocate and compute graph on the backend scheduler
     GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph); // returns success

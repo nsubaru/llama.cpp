@@ -650,11 +650,62 @@ static void test_graph_optimize_alloc_dep() {
     GGML_ASSERT(!graph_reuses_allocation(true));
 }
 
+static void test_borrowed_weights() {
+    auto [ctx, graph, ctx_ptr] = make_context();
+    auto source = dummy_backend_init(SIZE_MAX);
+    auto target = dummy_backend_init(SIZE_MAX);
+    source.context->device.iface.supports_op = [](ggml_backend_dev_t, const ggml_tensor * op) {
+        return op->op == GGML_OP_NONE || op->op == GGML_OP_VIEW || op->op == GGML_OP_RESHAPE;
+    };
+    ggml_backend_buffer_ptr storage(ggml_backend_buft_alloc_buffer(&source.buffer_type, 64));
+    auto * weight = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    GGML_ASSERT(ggml_backend_tensor_alloc(storage.get(), weight, alloc_base) == GGML_STATUS_SUCCESS);
+    ggml_backend_buffer_set_usage(storage.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_buffer_set_borrowed_read_only(storage.get());
+    auto * alias = ggml_view_1d(ctx, weight, 4, 0);
+    auto * nested = ggml_view_1d(ctx, alias, 4, 0);
+    GGML_ASSERT(ggml_backend_tensor_is_borrowed_read_only(nested));
+    auto * output = ggml_scale(ctx, nested, 2.0f);
+    ggml_build_forward_expand(graph, output);
+    ggml_backend_t backends[] = { &target.context->backend, &source.context->backend };
+    ggml_backend_buffer_type_t types[] = { &target.buffer_type, &source.buffer_type };
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, types, 2, 32, false, true));
+    ggml_backend_sched_set_tensor_backend(sched.get(), output, backends[0]);
+    size_t sizes[2] = {};
+    GGML_ASSERT(!ggml_backend_sched_reserve_size(sched.get(), graph, sizes));
+    GGML_ASSERT(target.context->allocated_total() == 0);
+
+    auto * write_graph = graph;
+    ggml_graph_clear(write_graph);
+    auto * write = ggml_scale_inplace(ctx, nested, 3.0f);
+    ggml_build_forward_expand(write_graph, write);
+    GGML_ASSERT(ggml_backend_graph_compute_async(backends[1], write_graph) == GGML_STATUS_FAILED);
+}
+
 static void run(const char * name, void (*f)()) {
     printf("%s ", name);
     fflush(stdout);
     f();
     printf("PASSED\n");
+}
+
+static void test_runtime_pool_admission() {
+    auto backend = dummy_backend_init(SIZE_MAX);
+    auto * device = &backend.context->device;
+    ggml_backend_allocation_diagnostics before{}, after{};
+    ggml_backend_get_allocation_diagnostics(&before);
+    GGML_ASSERT(ggml_backend_set_runtime_memory_limit(device, 100));
+    GGML_ASSERT(ggml_backend_reserve_runtime_memory(device, 60));
+    GGML_ASSERT(!ggml_backend_reserve_runtime_memory(device, 41));
+    GGML_ASSERT(!ggml_backend_set_runtime_memory_limit(device, 59));
+    GGML_ASSERT(ggml_backend_reserve_runtime_memory(device, 40));
+    GGML_ASSERT(!ggml_backend_reserve_runtime_memory(device, SIZE_MAX));
+    ggml_backend_release_runtime_memory(device, 60);
+    GGML_ASSERT(ggml_backend_reserve_runtime_memory(device, 60));
+    ggml_backend_release_runtime_memory(device, 100);
+    ggml_backend_get_allocation_diagnostics(&after);
+    GGML_ASSERT(after.runtime_pool_bytes == before.runtime_pool_bytes);
+    GGML_ASSERT(ggml_backend_set_runtime_memory_limit(device, UINT64_MAX));
 }
 
 int main() {
@@ -672,5 +723,7 @@ int main() {
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
+    run("test_borrowed_weights", test_borrowed_weights);
+    run("test_runtime_pool_admission", test_runtime_pool_admission);
     return 0;
 }

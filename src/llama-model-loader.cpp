@@ -717,6 +717,17 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
     }
 
+    if (files.empty()) {
+        for (int64_t i = 0; i < gguf_get_n_tensors(metadata); ++i) {
+            size_t elements = 1;
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                elements *= gguf_get_tensor_ne(metadata, i)[d];
+            }
+            n_elements += elements;
+            n_bytes += gguf_get_tensor_size(metadata, i);
+        }
+    }
+
     n_kv      = gguf_get_n_kv(metadata);
     n_tensors = files.empty() ? gguf_get_n_tensors(metadata) : weights_map.size();
 
@@ -1427,7 +1438,7 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
         if (!partial) {
             throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
         }
-        LLAMA_LOG_INFO("%s: partial load — used %d of %d tensors in the file (rest belong to a sibling model on the same .gguf)\n",
+        LLAMA_LOG_INFO("%s: partial load â€” used %d of %d tensors in the file (rest belong to a sibling model on the same .gguf)\n",
                 __func__, n_created, n_tensors);
     }
     if (n_tensors_moved > 0) {
@@ -1470,6 +1481,11 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
         }
     }
 
+    // Borrowed models do not have file-backed entries in weights_map.
+    if (borrowed_buffer_data != nullptr) {
+        size_data = n_bytes;
+        return;
+    }
     // compute the total size of all tensors for progress reporting
     for (const auto & it : weights_map) {
         size_data += ggml_nbytes(it.second.tensor);
@@ -1563,7 +1579,7 @@ bool llama_model_loader::load_all_data(
             }
 
             size_done += nbytes;
-            if (progress_callback && !progress_callback((float) size_done / size_data, progress_callback_user_data)) {
+            if (progress_callback && !progress_callback((size_data == 0 ? 1.0f : std::min(1.0f, (float) size_done / size_data)), progress_callback_user_data)) {
                 return false;
             }
         }
@@ -1704,7 +1720,7 @@ bool llama_model_loader::load_all_data(
         }
 
         if (progress_callback) {
-            if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {
+            if (!progress_callback((size_data == 0 ? 1.0f : std::min(1.0f, (float) size_done / size_data)), progress_callback_user_data)) {
                 return false;
             }
         }

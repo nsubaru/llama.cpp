@@ -1439,6 +1439,168 @@ static std::pair<int, int> test_gguf_set_kv(ggml_backend_dev_t dev, const unsign
 }
 
 
+
+// A complete tiny model lets metadata planning run with inaccessible payload pages.
+static std::pair<int, int> test_memory_plan() {
+    int pass = 0, total = 0;
+    auto check = [&](bool value, const char * name) {
+        ++total;
+        if (value) ++pass;
+        else fprintf(stderr, "memory plan: %s failed\n", name);
+    };
+    for (bool experts : {false, true}) {
+        auto * ctx = ggml_init({1024*1024, nullptr, true});
+        auto * meta = gguf_init_empty();
+        gguf_set_val_str(meta, "general.architecture", "llama");
+        gguf_set_val_u32(meta, "general.alignment", 4096);
+        gguf_set_val_str(meta, "tokenizer.ggml.model", "none");
+        gguf_set_val_u32(meta, "llama.vocab_size", 16);
+        gguf_set_val_u32(meta, "llama.context_length", 64);
+        gguf_set_val_u32(meta, "llama.embedding_length", 32);
+        gguf_set_val_u32(meta, "llama.block_count", 1);
+        gguf_set_val_u32(meta, "llama.feed_forward_length", 64);
+        gguf_set_val_u32(meta, "llama.attention.head_count", 4);
+        gguf_set_val_f32(meta, "llama.attention.layer_norm_rms_epsilon", 1e-5f);
+        // Re-read the header to apply the serialized alignment to the writer context.
+        std::vector<uint8_t> initial(gguf_get_meta_size(meta));
+        gguf_get_meta_data(meta, initial.data());
+        auto * aligned_meta = gguf_init_from_buffer(initial.data(), initial.size(), {true, nullptr});
+        gguf_free(meta);
+        meta = aligned_meta;
+        if (!meta) std::abort();
+        size_t payload = 0;
+        auto tensor = [&](const char * name, int64_t a, int64_t b = 1, int64_t c = 1) {
+            auto * value = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, a, b, c);
+            ggml_set_name(value, name);
+            gguf_add_tensor(meta, value);
+            payload += GGML_PAD(ggml_nbytes(value), 4096);
+        };
+        tensor("token_embd.weight", 32, 16);
+        tensor("output_norm.weight", 32);
+        tensor("output.weight", 32, 16);
+        tensor("blk.0.attn_norm.weight", 32);
+        tensor("blk.0.attn_q.weight", 32, 32);
+        tensor("blk.0.attn_k.weight", 32, 32);
+        tensor("blk.0.attn_v.weight", 32, 32);
+        tensor("blk.0.attn_output.weight", 32, 32);
+        tensor("blk.0.ffn_norm.weight", 32);
+        if (experts) {
+            gguf_set_val_u32(meta, "llama.expert_count", 2);
+            gguf_set_val_u32(meta, "llama.expert_used_count", 1);
+            tensor("blk.0.ffn_gate_inp.weight", 32, 2);
+            tensor("blk.0.ffn_gate_exps.weight", 32, 64, 2);
+            tensor("blk.0.ffn_up_exps.weight", 32, 64, 2);
+            tensor("blk.0.ffn_down_exps.weight", 64, 32, 2);
+        } else {
+            tensor("blk.0.ffn_gate.weight", 32, 64);
+            tensor("blk.0.ffn_up.weight", 32, 64);
+            tensor("blk.0.ffn_down.weight", 64, 32);
+        }
+        const size_t header = gguf_get_meta_size(meta);
+        const size_t length = header + payload;
+#if defined(_WIN32)
+        auto * mapping = static_cast<uint8_t *>(VirtualAlloc(nullptr, length, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (!mapping) std::abort();
+        gguf_get_meta_data(meta, mapping);
+        DWORD previous = 0;
+        if (!VirtualProtect(mapping + header, payload, PAGE_NOACCESS, &previous)) std::abort();
+#else
+        auto * mapping = static_cast<uint8_t *>(mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+        if (mapping == MAP_FAILED) std::abort();
+        gguf_get_meta_data(meta, mapping);
+        if (mprotect(mapping + header, payload, PROT_NONE) != 0) std::abort();
+#endif
+        auto mp = llama_model_default_params();
+        mp.n_gpu_layers = 0;
+        mp.no_host = true;
+        auto cp = llama_context_default_params();
+        cp.n_ctx = 64;
+        cp.n_batch = 16;
+        cp.n_ubatch = 16;
+        cp.n_outputs_max = 1;
+        cp.n_threads = cp.n_threads_batch = 2;
+        cp.offload_kqv = false;
+        cp.op_offload = false;
+        std::vector<llama_model_tensor_view> views;
+        if (experts) {
+            const int count = llama_model_describe_expert_parts(mapping, length, nullptr, 0);
+            check(count == 3, "expert bank metadata");
+            std::vector<llama_model_tensor_part> parts(count > 0 ? count : 0);
+            llama_model_describe_expert_parts(mapping, length, parts.data(), parts.size());
+            // Names must outlive the plan, so use the GGUF's stable tensor names.
+            for (const auto & part : parts) {
+                const int index = gguf_find_tensor(meta, part.name);
+                views.push_back({gguf_get_tensor_name(meta, index), mapping + part.offset, (size_t)part.size});
+            }
+        }
+        llama_memory_plan plan{sizeof(llama_memory_plan), 1};
+        ggml_backend_buffer_diagnostics before{}, after{};
+        ggml_backend_get_buffer_diagnostics(&before);
+        const auto count = llama_memory_plan_from_buffer_view(mapping, length, views.data(), views.size(), mp, cp, &plan, nullptr, 0);
+        check(count > 0, "planning protected payload");
+        std::vector<llama_memory_plan_buffer> buffers(count > 0 ? count : 0);
+        check(llama_memory_plan_from_buffer_view(mapping, length, views.data(), views.size(), mp, cp, &plan, buffers.data(), buffers.size()) == count, "stable plan");
+        uint64_t borrowed = 0, output = 0, compute = 0;
+        for (const auto & buffer : buffers) {
+            borrowed += buffer.borrowed_model_bytes;
+            output += buffer.output_bytes;
+            compute += buffer.compute_bytes;
+            check(buffer.owned_model_bytes == 0, "borrowed CPU weights");
+        }
+        check(borrowed > 0 && output > 0 && compute > 0, "complete plan categories");
+        ggml_backend_get_buffer_diagnostics(&after);
+        check(before.owned_host_bytes == after.owned_host_bytes && before.owned_device_bytes == after.owned_device_bytes,
+            "no retained payload allocation");
+        // The plan must also bound real prefill/decode with immutable payload pages.
+#if defined(_WIN32)
+        if (!VirtualProtect(mapping + header, payload, PAGE_READONLY, &previous)) std::abort();
+#else
+        if (mprotect(mapping + header, payload, PROT_READ) != 0) std::abort();
+#endif
+        auto * real_model = experts
+            ? llama_model_load_from_expert_views(mapping, length, views.data(), views.size(), mp)
+            : llama_model_load_from_buffer_view(mapping, length, mp);
+        check(real_model != nullptr, "real borrowed model");
+        auto * real_context = real_model ? llama_init_from_model(real_model, cp) : nullptr;
+        check(real_context != nullptr, "real context");
+        if (real_context) {
+            llama_token tokens[16] = {};
+            for (int i = 0; i < 16; ++i) tokens[i] = i;
+            check(llama_decode(real_context, llama_batch_get_one(tokens, 16)) == 0, "real prefill");
+            for (int i = 0; i < 3; ++i)
+                check(llama_decode(real_context, llama_batch_get_one(tokens, 1)) == 0, "real generation");
+            llama_synchronize(real_context);
+            ggml_backend_get_buffer_diagnostics(&after);
+            ggml_backend_allocation_diagnostics allocations{};
+            ggml_backend_get_allocation_diagnostics(&allocations);
+            uint64_t planned = 0;
+            for (const auto & buffer : buffers)
+                planned += buffer.context_bytes + buffer.compute_bytes + buffer.output_bytes + buffer.scratch_bytes;
+            fprintf(stderr, "plan-bound-check: planned=%llu buffers=%llu scratch=%llu\n",
+                (unsigned long long)planned, (unsigned long long)(after.owned_host_bytes - before.owned_host_bytes),
+                (unsigned long long)allocations.current[GGML_BACKEND_ALLOCATION_CPU_SCRATCH]);
+            check(after.owned_host_bytes - before.owned_host_bytes + allocations.current[GGML_BACKEND_ALLOCATION_CPU_SCRATCH] <= planned,
+                "real state/workspace bounded by plan");
+            check(after.protected_copy_attempts == before.protected_copy_attempts, "no protected expert transfer");
+            llama_free(real_context);
+        }
+        if (real_model) llama_model_free(real_model);
+        ggml_backend_get_buffer_diagnostics(&after);
+        check(after.owned_host_bytes == before.owned_host_bytes && after.borrowed_bytes == before.borrowed_bytes,
+            "allocation release returns to baseline");
+        plan.version = 999;
+        check(llama_memory_plan_from_buffer_view(mapping, length, nullptr, 0, mp, cp, &plan, nullptr, 0) == -1, "ABI mismatch");
+#if defined(_WIN32)
+        VirtualFree(mapping, 0, MEM_RELEASE);
+#else
+        munmap(mapping, length);
+#endif
+        gguf_free(meta);
+        ggml_free(ctx);
+    }
+    return {pass, total};
+}
+
 // Expert descriptors and copying must remain independent of model allocation and weight residency.
 static std::pair<int, int> test_expert_parts() {
     int pass = 0, total = 0;
@@ -1604,6 +1766,9 @@ int main(int argc, char ** argv) {
     int ntest = 0;
     {
         auto result = test_expert_parts();
+        auto planned = test_memory_plan();
+        result.first += planned.first;
+        result.second += planned.second;
         npass += result.first;
         ntest += result.second;
     }

@@ -64,6 +64,26 @@ set_source_files_properties(${LLAMA_CORE_SOURCES} ../include/llama.h unicode.h
 
 configure_file(llama-version.h.in ${CMAKE_CURRENT_BINARY_DIR}/llama-version.h @ONLY)
 
+# Serialized state is a disposable cache, valid only for this exact implementation and toolchain.
+# Reconfigure on source edits too: a Git commit alone does not identify local fork changes.
+file(GLOB_RECURSE LLAMA_STATE_ID_INPUTS CONFIGURE_DEPENDS
+    "${PROJECT_SOURCE_DIR}/src/*.cpp" "${PROJECT_SOURCE_DIR}/src/*.h"
+    "${PROJECT_SOURCE_DIR}/include/*.h" "${PROJECT_SOURCE_DIR}/ggml/include/*.h"
+    "${PROJECT_SOURCE_DIR}/ggml/src/*.cpp" "${PROJECT_SOURCE_DIR}/ggml/src/*.h"
+    "${PROJECT_SOURCE_DIR}/ggml/src/*.c" "${PROJECT_SOURCE_DIR}/ggml/src/*.cu"
+    "${PROJECT_SOURCE_DIR}/ggml/src/*.cuh")
+list(SORT LLAMA_STATE_ID_INPUTS)
+set(LLAMA_STATE_ID_MATERIAL "${CMAKE_CXX_COMPILER_ID};${CMAKE_CXX_COMPILER_VERSION};${CMAKE_SIZEOF_VOID_P};${CMAKE_CXX_FLAGS};${CMAKE_CUDA_ARCHITECTURES};${GGML_CUDA};${GGML_NATIVE};${GGML_AVX512}")
+foreach(LLAMA_STATE_ID_FILE IN LISTS LLAMA_STATE_ID_INPUTS)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${LLAMA_STATE_ID_FILE}")
+    file(SHA256 "${LLAMA_STATE_ID_FILE}" LLAMA_STATE_ID_HASH)
+    string(APPEND LLAMA_STATE_ID_MATERIAL ";${LLAMA_STATE_ID_HASH}")
+endforeach()
+string(SHA256 LLAMA_STATE_BUILD_ID "${LLAMA_STATE_ID_MATERIAL}")
+file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/llama-state-build-id-$<CONFIG>.h"
+    CONTENT "#define LLAMA_STATE_BUILD_ID \"${LLAMA_STATE_BUILD_ID}:$<CONFIG>\"\n")
+target_compile_definitions(llama PRIVATE LLAMA_STATE_BUILD_ID_HEADER="llama-state-build-id-$<CONFIG>.h")
+
 target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR})
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
