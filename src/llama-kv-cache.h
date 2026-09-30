@@ -114,7 +114,7 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
-                 const char *   name_tag = "");
+                 const char *   name_tag = "", const llama_memory_params & allocation = {});
 
     ~llama_kv_cache() = default;
 
@@ -156,6 +156,12 @@ public:
     //
 
     uint32_t get_size()     const;
+    uint32_t get_allocated_size() const { return other ? other->get_allocated_size() : allocated_cells; }
+    bool can_commit_capacity(uint32_t tokens) const;
+    uint32_t capacity_cells(uint32_t tokens) const;
+    void plan_capacity(uint32_t tokens) { allocated_cells = capacity_cells(tokens); }
+    bool commit_capacity(uint32_t tokens);
+    std::map<ggml_backend_buffer_type_t, size_t> capacity_plan(uint32_t tokens) const;
     uint32_t get_n_stream() const;
 
     bool get_has_shift() const;
@@ -244,6 +250,12 @@ public:
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
 private:
+    uint32_t allocated_cells = 0;
+    uint32_t context_max = 0;
+    bool dynamic_backing = false;
+    std::map<const ggml_tensor *, size_t> tensor_offsets;
+    std::vector<ggml_backend_buffer_range> backing_ranges(ggml_context * ctx, ggml_backend_buffer_type_t buft, uint32_t cells) const;
+
     const llama_model & model;
     const llama_hparams & hparams;
 

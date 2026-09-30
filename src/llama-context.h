@@ -64,6 +64,9 @@ struct llama_context {
     ggml_backend_sched_t get_sched() const;
 
     uint32_t n_ctx()     const;
+    uint32_t n_ctx_allocated() const { return cparams.n_ctx_allocated; }
+    bool set_capacity(uint32_t capacity);
+    llama_memory_breakdown plan_capacity(uint32_t capacity);
     uint32_t n_ctx_seq() const;
     uint32_t n_batch()   const;
     uint32_t n_ubatch()  const;
@@ -290,6 +293,8 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
+    std::vector<llama_kv_cache *> kv_caches;
+    bool dynamic_capacity = false;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

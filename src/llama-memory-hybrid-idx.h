@@ -37,7 +37,7 @@ public:
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
                             /* the indexer cache exists only if this is given */
-    const layer_filter_cb & filter_idx);
+    const layer_filter_cb & filter_idx, const llama_memory_params & allocation = {});
 
     ~llama_memory_hybrid_idx() = default;
 

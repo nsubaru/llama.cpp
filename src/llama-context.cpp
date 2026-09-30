@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-kv-cache.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -303,6 +304,10 @@ llama_context::llama_context(
         }
     }
 
+    dynamic_capacity = params.n_ctx_initial != 0;
+    if (dynamic_capacity && cparams.ctx_other) throw std::runtime_error("live-growing KV backing cannot share another context");
+    cparams.n_ctx_allocated = dynamic_capacity ? std::min(cparams.n_ctx_seq, GGML_PAD(std::min(params.n_ctx_initial, cparams.n_ctx_seq), 256u)) : cparams.n_ctx_seq;
+
     LLAMA_LOG_INFO("%s: n_seq_max             = %u\n",   __func__, cparams.n_seq_max);
     LLAMA_LOG_INFO("%s: n_ctx                 = %u\n",   __func__, cparams.n_ctx);
     LLAMA_LOG_INFO("%s: n_ctx_seq             = %u\n",   __func__, cparams.n_ctx_seq);
@@ -394,6 +399,9 @@ llama_context::llama_context(
             /*.swa_full  =*/ params.swa_full,
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+            /*.n_ctx_initial =*/ params.n_ctx_initial ? cparams.n_ctx_allocated : 0,
+            /*.n_ctx_max =*/ cparams.n_ctx_seq,
+            /*.caches =*/ &kv_caches,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -597,7 +605,7 @@ void llama_context::sched_reserve() {
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_tokens = std::min(cparams.n_ctx_allocated, cparams.n_ubatch);
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
 
@@ -766,6 +774,111 @@ ggml_backend_sched_t llama_context::get_sched() const {
     return sched.get();
 }
 
+llama_memory_breakdown llama_context::plan_capacity(uint32_t capacity) {
+    if (!capacity || capacity > cparams.n_ctx_seq) throw std::runtime_error("invalid context capacity");
+    synchronize();
+    auto result = llama_get_memory_breakdown(this);
+    for (auto * cache : kv_caches) {
+        for (const auto & item : cache->memory_breakdown()) result[item.first].context -= item.second;
+        for (const auto & item : cache->capacity_plan(capacity)) result[item.first].context += item.second;
+    }
+
+    // Planning owns separate graph metadata. It must neither allocate payload buffers nor
+    // replace the scheduler and reusable graphs belonging to the live context.
+    const auto previous = cparams.n_ctx_allocated;
+    const auto previous_compute = backend_buf_exp_size;
+    const auto previous_scratch = cpu_work_exp_size;
+    const auto previous_outputs = n_outputs;
+    const auto previous_active = gf_res_prev_active;
+    auto previous_sched = std::move(sched);
+    auto previous_reserve = std::move(gf_res_reserve);
+    auto previous_graphs = std::move(gf_res_prev);
+    auto restore = [&] {
+        sched = std::move(previous_sched);
+        gf_res_reserve = std::move(previous_reserve);
+        gf_res_prev = std::move(previous_graphs);
+        gf_res_prev_active = previous_active;
+        backend_buf_exp_size = previous_compute;
+        cpu_work_exp_size = previous_scratch;
+        n_outputs = previous_outputs;
+        cparams.n_ctx_allocated = previous;
+        for (auto * cache : kv_caches) cache->plan_capacity(previous);
+    };
+    try {
+        cparams.n_ctx_allocated = capacity;
+        for (auto * cache : kv_caches) cache->plan_capacity(capacity);
+        auto mctx = memory ? memory->init_full() : nullptr;
+        const auto n_tokens = std::min(capacity, cparams.n_ubatch);
+        const auto max_nodes = graph_max_nodes(std::max(n_tokens, cparams.n_seq_max));
+        gf_res_reserve.reset(new llm_graph_result(max_nodes));
+        sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+        if (!sched) throw std::runtime_error("could not create context planning scheduler");
+        backend_buf_exp_size.assign(backend_ptrs.size(), 0);
+        cpu_work_exp_size = 0;
+        std::vector<size_t> pp(backend_ptrs.size()), tg(backend_ptrs.size()), diag(backend_ptrs.size());
+        if (!graph_reserve(n_tokens, cparams.n_seq_max, std::min(n_tokens, cparams.n_outputs_max), mctx.get(), true, pp.data()) ||
+            !graph_reserve(cparams.n_seq_max, cparams.n_seq_max, cparams.n_seq_max, mctx.get(), true, tg.data()))
+            throw std::runtime_error("could not plan context compute growth");
+        if ((model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_MINIMAX_01) &&
+                !graph_reserve(n_tokens, 1, std::min(n_tokens, cparams.n_outputs_max), mctx.get(), true, diag.data()))
+            throw std::runtime_error("could not plan diagonal decay compute growth");
+
+        std::map<ggml_backend_buffer_type_t, size_t> compute;
+        for (size_t i = 0; i < pp.size(); ++i) compute[backend_buft[i]] += std::max({pp[i], tg[i], diag[i]});
+        compute[ggml_backend_cpu_buffer_type()] += cpu_work_exp_size;
+        for (const auto & item : compute) result[item.first].compute = std::max(result[item.first].compute, item.second);
+        result[ggml_backend_cpu_buffer_type()].scratch = std::max(previous_scratch, cpu_work_exp_size);
+        restore();
+        return result;
+    } catch (...) { restore(); throw; }
+}
+
+bool llama_context::set_capacity(uint32_t capacity) {
+    if (!capacity || capacity > cparams.n_ctx_seq) return false;
+    if (capacity == cparams.n_ctx_allocated) return true;
+    if (!dynamic_capacity) return false;
+    for (auto * cache : kv_caches) if (!cache->can_commit_capacity(capacity)) return false;
+    synchronize();
+    const auto previous = cparams.n_ctx_allocated;
+    const auto previous_scratch = cpu_work_exp_size;
+    bool replacing_compute = false;
+    auto rollback = [&] {
+        // Dispose all partially allocated compute buffers before returning KV pages.
+        if (replacing_compute) sched.reset();
+        for (auto * cache : kv_caches) {
+            if (!cache->commit_capacity(previous)) throw std::runtime_error("could not restore previous context backing");
+        }
+        cparams.n_ctx_allocated = previous;
+        cpu_work_exp_size = previous_scratch;
+        if (replacing_compute) {
+            backend_buf_exp_size.assign(backend_ptrs.size(), 0);
+            sched_need_reserve = true;
+            sched_reserve();
+        }
+    };
+    try {
+        for (auto * cache : kv_caches) {
+            if (!cache->commit_capacity(capacity)) { rollback(); return false; }
+        }
+        cparams.n_ctx_allocated = capacity;
+        cpu_work_exp_size = 0;
+        backend_buf_exp_size.assign(backend_ptrs.size(), 0);
+        replacing_compute = true;
+        sched_need_reserve = true;
+        sched_reserve();
+        return true;
+    } catch (const std::exception & error) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, error.what());
+        rollback();
+        return false;
+    }
+}
+
+uint32_t llama_n_ctx_allocated(const llama_context * ctx) { return ctx->n_ctx_allocated(); }
+bool llama_set_n_ctx_allocated(llama_context * ctx, uint32_t capacity) { return ctx->set_capacity(capacity); }
+llama_memory_breakdown llama_plan_context_capacity(llama_context * ctx, uint32_t capacity) { return ctx->plan_capacity(capacity); }
+
 uint32_t llama_context::n_ctx() const {
     return cparams.n_ctx;
 }
@@ -845,7 +958,7 @@ bool llama_context::memory_update(bool optimize) {
         }
 
         const uint32_t n_seqs = cparams.n_seq_max;
-        const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+        const uint32_t n_tokens = std::min(cparams.n_ctx_allocated, cparams.n_ubatch);
 
         const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
 
@@ -3672,6 +3785,7 @@ void llama_context::opt_epoch(
 llama_context_params llama_context_default_params() {
     llama_context_params result = {
         /*.n_ctx                       =*/ 512,
+        /*.n_ctx_initial               =*/ 0,
         /*.n_batch                     =*/ 2048,
         /*.n_ubatch                    =*/ 512,
         /*.n_seq_max                   =*/ 1,

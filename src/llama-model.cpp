@@ -2349,7 +2349,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         hparams.swa_type,
                         nullptr,
                         filter_idx,
-                        nullptr);
+                        nullptr, params);
             } break;
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_DEEPSEEK32:
@@ -2377,7 +2377,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             filter,
                             nullptr,
-                            nullptr);
+                            nullptr, "", params);
                 } else {
                     // Main context: DSA cache for the trunk layers only - the nextn
                     // layer(s) are never attended by the trunk graph.
@@ -2401,7 +2401,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             hparams.swa_type,
                             filter_mla,
                             filter_lid,
-                            nullptr);
+                            nullptr, params);
                 }
             } break;
         case LLM_ARCH_HY_V4:
@@ -2424,7 +2424,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             nullptr,
                             nullptr,
-                            nullptr);
+                            nullptr, "", params);
                 } else {
                     // only "full" layers own an indexer, so the shared layers need no indexer cache
                     llama_kv_cache::layer_filter_cb filter_lid = [&](uint32_t il) { return hparams.is_indexer_full(il); };
@@ -2443,7 +2443,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             hparams.swa_type,
                             nullptr,
                             filter_lid,
-                            nullptr);
+                            nullptr, params);
                 }
             } break;
         case LLM_ARCH_DOTS3NOTE:
@@ -2471,7 +2471,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             filter,
                             nullptr,
-                            nullptr);
+                            nullptr, "", params);
                 } else {
                     // main context: DSA cache for the trunk full-attention layers plus a window-sized SWA cache
                     llama_kv_cache::layer_filter_cb filter_mla = nullptr;
@@ -2494,7 +2494,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             1,
                             filter_mla,
                             filter_lid,
-                            nullptr);
+                            nullptr, params);
                 }
             } break;
         case LLM_ARCH_DEEPSEEK4:
@@ -2521,7 +2521,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             filter_mtp,
                             nullptr,
-                            nullptr);
+                            nullptr, params);
                 } else {
                     res = new llama_kv_cache_dsv4(
                             *this,
@@ -2537,7 +2537,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             1,
                             cparams.n_rs_seq,
                             nullptr,
-                            nullptr);
+                            nullptr, params);
                 }
             } break;
         case LLM_ARCH_DFLASH:
@@ -2561,7 +2561,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             nullptr,
                             nullptr,
-                            nullptr);
+                            nullptr, params);
                     break;
                 }
             }
@@ -2643,7 +2643,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr), params);
                     } else if (needs_mem_idx) {
                         // sparse attention over a per-token indexer cache, in its own memory type
                         res = new llama_memory_hybrid_idx(
@@ -2664,7 +2664,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
-                            /* filter_idx        */ std::move(filter_idx));
+                            /* filter_idx        */ std::move(filter_idx), params);
                     } else {
                         res = new llama_memory_hybrid(
                             /* model             */ *this,
@@ -2683,7 +2683,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr), params);
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;
@@ -2747,7 +2747,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     mem_other,
                                     filter,
                                     reuse,
-                                    share);
+                                    share, params);
                         } else {
                             res = new llama_kv_cache_iswa(
                                     *this,
@@ -2764,7 +2764,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     nullptr,
                                     filter,
                                     reuse,
-                                    share);
+                                    share, params);
                         }
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
@@ -2785,7 +2785,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 nullptr,
                                 filter,
                                 nullptr,
-                                nullptr);
+                                nullptr, "", params);
                     }
                 }
             }

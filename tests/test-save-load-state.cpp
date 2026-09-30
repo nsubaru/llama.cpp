@@ -2,6 +2,9 @@
 #include "common.h"
 #include "log.h"
 #include "llama-cpp.h"
+#include "../src/llama-ext.h"
+#include <cmath>
+#include <chrono>
 
 #include <algorithm>
 #include <clocale>
@@ -508,7 +511,216 @@ static bool test_state_roundtrip(struct llama_model * model, const struct common
 }
 
 
-// Run the full save/load test suite (tests 1-8) for a single model.
+// Compare growing and fixed contexts on every generated architecture fixture, including
+// SWA, recurrent hybrids and compressed caches. Restoration must use the same maximum.
+static bool test_live_capacity_state(llama_model * model, const common_params & params) {
+    const auto failure = [] (int line) {
+        LOG_ERR("live capacity check failed at source line %d\n", line);
+        return false;
+    };
+    auto cp = common_context_params_to_llama(params);
+    cp.n_ctx = 4096;
+    cp.n_seq_max = 1;
+    cp.kv_unified = true;
+    cp.n_batch = cp.n_ubatch = 64;
+    cp.n_outputs_max = 1;
+    cp.n_ctx_initial = 0;
+    auto fixed = llama_context_ptr{llama_init_from_model(model, cp)};
+    cp.n_ctx_initial = 256;
+    auto growing = llama_context_ptr{llama_init_from_model(model, cp)};
+    if (!fixed || !growing) return failure(__LINE__);
+    const auto vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    llama_batch_ptr batch(64, 0, 1);
+    auto state = [](llama_context * ctx) {
+        std::vector<uint8_t> data(llama_state_seq_get_size(ctx, 0));
+        GGML_ASSERT(llama_state_seq_get_data(ctx, data.data(), data.size(), 0) == data.size());
+        return data;
+    };
+    for (uint32_t pos = 0; pos < 1280; pos += 64) {
+        const uint32_t required = pos + 64;
+        if (required > llama_n_ctx_allocated(growing.get())) {
+            const auto before = state(growing.get());
+            const auto bytes_before = llama_get_memory_breakdown(growing.get());
+            const auto planned = llama_plan_context_capacity(growing.get(), pos + 256);
+            if (state(growing.get()) != before || llama_n_ctx_allocated(growing.get()) != pos) return failure(__LINE__);
+            const auto bytes_after = llama_get_memory_breakdown(growing.get());
+            for (const auto & item : bytes_before) {
+                if (bytes_after.at(item.first).context != item.second.context ||
+                    bytes_after.at(item.first).compute != item.second.compute) return failure(__LINE__);
+            }
+            if (!llama_set_n_ctx_allocated(growing.get(), pos + 256) || state(growing.get()) != before) return failure(__LINE__);
+            // The estimate for the actual 256-row step must cover its committed buffers.
+            for (const auto & item : llama_get_memory_breakdown(growing.get())) {
+                if (item.second.context > planned.at(item.first).context ||
+                    item.second.compute > planned.at(item.first).compute) return failure(__LINE__);
+            }
+        }
+        common_batch_clear(batch.get());
+        for (uint32_t i = 0; i < 64; ++i) common_batch_add(batch.get(), (pos + i) % vocab, pos + i, {0}, i == 63);
+        if (llama_decode(fixed.get(), batch.get()) || llama_decode(growing.get(), batch.get())) return failure(__LINE__);
+        const auto * a = llama_get_logits(fixed.get());
+        const auto * b = llama_get_logits(growing.get());
+        for (int i = 0; i < vocab; ++i) {
+            if (!std::isfinite(a[i]) || !std::isfinite(b[i]) || std::abs(a[i] - b[i]) > 1e-4f * (1 + std::abs(a[i]))) {
+                LOG_ERR("%s: growing logits differ at position %u, token %d\n", __func__, required - 1, i);
+                return failure(__LINE__);
+            }
+        }
+    }
+    const auto saved = state(growing.get());
+    auto restored = llama_context_ptr{llama_init_from_model(model, cp)};
+    if (!restored || !llama_set_n_ctx_allocated(restored.get(), 1280) ||
+        llama_state_seq_set_data(restored.get(), saved.data(), saved.size(), 0) != saved.size() ||
+        state(restored.get()) != saved) return failure(__LINE__);
+    common_batch_clear(batch.get());
+    common_batch_add(batch.get(), 3 % vocab, 1280, {0}, true);
+    if (!llama_set_n_ctx_allocated(restored.get(), 1536) ||
+        !llama_set_n_ctx_allocated(growing.get(), 1536) ||
+        llama_decode(restored.get(), batch.get()) || llama_decode(growing.get(), batch.get())) return failure(__LINE__);
+    const auto * continued = llama_get_logits(growing.get());
+    const auto * recovered = llama_get_logits(restored.get());
+    for (int i = 0; i < vocab; ++i) {
+        if (!std::isfinite(continued[i]) || !std::isfinite(recovered[i]) ||
+                std::abs(continued[i] - recovered[i]) > 1e-4f * (1 + std::abs(continued[i]))) {
+            LOG_ERR("%s: restored continuation differs at token %d\n", __func__, i);
+            return failure(__LINE__);
+        }
+    }
+    // Sliding caches may choose a different valid ring slot after restoration.
+    LOG("\nPASS: live capacity and snapshot continuation\n");
+    return true;
+}
+
+// Exercise a real model with sequential fixed/growing contexts to bound peak VRAM.
+static bool test_live_capacity_benchmark(common_params params, uint32_t prefill_tokens) {
+    auto init = common_init_from_params(params, true);
+    auto * model = init->model();
+    if (!model) return false;
+    auto cp = common_context_params_to_llama(params);
+    cp.n_ctx = params.n_ctx ? params.n_ctx : llama_model_n_ctx_train(model);
+    cp.n_seq_max = 1;
+    cp.kv_unified = true;
+    cp.n_outputs_max = 1;
+    cp.n_ctx_initial = std::min(32768u, cp.n_ctx);
+    if (!prefill_tokens || prefill_tokens >= cp.n_ctx) return false;
+    auto growing = llama_context_ptr{llama_init_from_model(model, cp)};
+    if (!growing) return false;
+    const auto vocab_size = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    auto state = [](llama_context * ctx) {
+        std::vector<uint8_t> data(llama_state_seq_get_size(ctx, 0));
+        GGML_ASSERT(llama_state_seq_get_data(ctx, data.data(), data.size(), 0) == data.size());
+        return data;
+    };
+    auto logits = [&](llama_context * ctx) {
+        const float * values = llama_get_logits(ctx);
+        return std::vector<float>(values, values + vocab_size);
+    };
+    auto equivalent = [](const std::vector<float> & a, const std::vector<float> & b) {
+        float maximum = 0;
+        for (size_t i = 0; i < a.size(); ++i) {
+            if (!std::isfinite(a[i]) || !std::isfinite(b[i])) return false;
+            maximum = std::max(maximum, std::abs(a[i] - b[i]));
+            if (std::abs(a[i] - b[i]) > 1e-4f * (1 + std::abs(a[i]))) {
+                fprintf(stderr, "live-model-logits mismatch token=%zu a=%g b=%g\n", i, a[i], b[i]);
+                return false;
+            }
+        }
+        fprintf(stderr, "live-model-logits maximum_absolute_error=%g\n", maximum);
+        return true;
+    };
+    auto measure = [](llama_context * ctx, double growth_ms) {
+        size_t gpu_kv = 0, cpu_kv = 0, gpu_compute = 0, cpu_compute = 0, gpu_weights = 0;
+        for (const auto & item : llama_get_memory_breakdown(ctx)) {
+            if (ggml_backend_buft_is_host(item.first)) {
+                cpu_kv += item.second.context - item.second.output;
+                cpu_compute += item.second.compute;
+            } else {
+                gpu_kv += item.second.context - item.second.output;
+                gpu_compute += item.second.compute;
+                gpu_weights += item.second.model;
+            }
+        }
+        ggml_backend_allocation_diagnostics diagnostics{};
+        ggml_backend_get_allocation_diagnostics(&diagnostics);
+        fprintf(stderr, "live-model-memory capacity=%u gpu_kv=%zu cpu_kv=%zu gpu_compute=%zu cpu_compute=%zu gpu_weights=%zu cuda_committed=%llu runtime_pool=%llu growth_ms=%.3f\n",
+                llama_n_ctx_allocated(ctx), gpu_kv, cpu_kv, gpu_compute, cpu_compute, gpu_weights,
+                (unsigned long long) diagnostics.current[GGML_BACKEND_ALLOCATION_DEVICE],
+                (unsigned long long) diagnostics.runtime_pool_bytes, growth_ms);
+        fflush(stderr);
+    };
+    const auto text = params.prompt.empty() ? std::string("// Implement a Python function that computes Fibonacci numbers using iteration.\ndef fibonacci(n):\n") : params.prompt;
+    const auto pattern = common_tokenize(growing.get(), text, true);
+    if (pattern.empty()) return false;
+    llama_tokens tokens(prefill_tokens);
+    for (size_t i = 0; i < tokens.size(); ++i) tokens[i] = pattern[i % pattern.size()];
+    auto prefill = [&](llama_context * ctx, const char * phase) {
+        const auto started = std::chrono::steady_clock::now();
+        for (uint32_t pos = 0; pos < prefill_tokens;) {
+            const auto count = std::min<uint32_t>(cp.n_batch, prefill_tokens - pos);
+            if (pos + count > llama_n_ctx_allocated(ctx) &&
+                    !llama_set_n_ctx_allocated(ctx, std::min(cp.n_ctx, ((pos + count + 32767)/32768)*32768))) return false;
+            if (llama_decode(ctx, llama_batch_get_one(tokens.data() + pos, count))) return false;
+            pos += count;
+            if (pos % 2048 == 0 || pos == prefill_tokens) {
+                fprintf(stderr, "live-model-prefill phase=%s tokens=%u seconds=%.3f\n", phase, pos,
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+                fflush(stderr);
+            }
+        }
+        return true;
+    };
+    measure(growing.get(), 0);
+    if (!prefill(growing.get(), "growing")) return false;
+    const auto prefix = state(growing.get());
+    const auto prefix_logits = logits(growing.get());
+    std::vector<uint32_t> capacities;
+    for (uint32_t capacity : {32768u, 65536u, 131072u, cp.n_ctx})
+        if (capacity <= cp.n_ctx && capacity >= llama_n_ctx_allocated(growing.get()) &&
+                (capacities.empty() || capacity > capacities.back())) capacities.push_back(capacity);
+    for (const auto capacity : capacities) {
+        const auto before = llama_get_memory_breakdown(growing.get());
+        const auto plan = llama_plan_context_capacity(growing.get(), capacity);
+        if (state(growing.get()) != prefix) return false;
+        for (const auto & item : before) {
+            const auto after = llama_get_memory_breakdown(growing.get()).at(item.first);
+            if (after.context != item.second.context || after.compute != item.second.compute) return false;
+        }
+        const auto started = std::chrono::steady_clock::now();
+        if (!llama_set_n_ctx_allocated(growing.get(), capacity)) return false;
+        measure(growing.get(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+        if (state(growing.get()) != prefix) return false;
+        for (const auto & item : llama_get_memory_breakdown(growing.get()))
+            if (item.second.context > plan.at(item.first).context || item.second.compute > plan.at(item.first).compute) return false;
+    }
+    if (llama_set_n_ctx_allocated(growing.get(), cp.n_ctx + 1)) return false;
+    llama_token next = std::max_element(prefix_logits.begin(), prefix_logits.end()) - prefix_logits.begin();
+    if (llama_decode(growing.get(), llama_batch_get_one(&next, 1))) return false;
+    const auto saved = state(growing.get());
+    const auto continued = logits(growing.get());
+    llama_token restored_next = std::max_element(continued.begin(), continued.end()) - continued.begin();
+    if (llama_decode(growing.get(), llama_batch_get_one(&restored_next, 1))) return false;
+    const auto original_continued = logits(growing.get());
+    growing.reset();
+    cp.n_ctx_initial = 0;
+    auto fixed = llama_context_ptr{llama_init_from_model(model, cp)};
+    if (!fixed || !prefill(fixed.get(), "fixed")) return false;
+    measure(fixed.get(), 0);
+    if (!equivalent(prefix_logits, logits(fixed.get())) || state(fixed.get()) != prefix ||
+            llama_decode(fixed.get(), llama_batch_get_one(&next, 1)) || !equivalent(continued, logits(fixed.get()))) return false;
+    fixed.reset();
+    cp.n_ctx_initial = std::min(32768u, cp.n_ctx);
+    auto restored = llama_context_ptr{llama_init_from_model(model, cp)};
+    const uint32_t restored_capacity = std::min(cp.n_ctx, ((prefill_tokens + 1 + 32767)/32768)*32768);
+    if (!restored || !llama_set_n_ctx_allocated(restored.get(), restored_capacity) ||
+            llama_state_seq_set_data(restored.get(), saved.data(), saved.size(), 0) != saved.size() ||
+            state(restored.get()) != saved) return false;
+    if (llama_decode(restored.get(), llama_batch_get_one(&restored_next, 1)) ||
+            !equivalent(original_continued, logits(restored.get()))) return false;
+    fprintf(stderr, "PASS: real model capacity, fixed equivalence and restored continuation; prefill=%u maximum=%u\n", prefill_tokens, cp.n_ctx);
+    return true;
+}
+
+// Run the full save/load test suite (tests 1-9) for a single model.
 // Returns true if all tests pass, false otherwise.
 static bool run_save_load_tests_for_model(const std::string & model_path, const struct common_params & base_params) {
     struct common_params params = base_params;
@@ -590,6 +802,8 @@ static bool run_save_load_tests_for_model(const std::string & model_path, const 
         return false;
     }
 
+    if (!test_live_capacity_state(model, params)) return false;
+
     LOG("\nAll tests passed.\n");
 
     return true;
@@ -609,10 +823,17 @@ int main(int argc, char ** argv) {
 
     // extract our own --models DIR option before handing the rest to the common arg parser
     std::string models_dir;
+    bool live_benchmark = false;
+    uint32_t live_prefill = 32768;
     std::vector<char *> filtered_argv;
     filtered_argv.push_back(argv[0]);
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--models") == 0) {
+        if (strcmp(argv[i], "--live-kv-benchmark") == 0) {
+            live_benchmark = true;
+        } else if (strcmp(argv[i], "--live-kv-prefill") == 0) {
+            if (i + 1 >= argc) return 1;
+            live_prefill = std::stoul(argv[++i]);
+        } else if (strcmp(argv[i], "--models") == 0) {
             if (i + 1 >= argc) {
                 LOG_ERR("%s: --models requires a directory argument\n", __func__);
                 return 1;
@@ -646,6 +867,8 @@ int main(int argc, char ** argv) {
     }
 
     ggml_backend_load_all();
+
+    if (live_benchmark) return test_live_capacity_benchmark(params, live_prefill) ? 0 : 1;
 
     if (!models_dir.empty()) {
         // run the suite over every dummy model in the directory

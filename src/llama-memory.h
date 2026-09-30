@@ -14,6 +14,8 @@ class llama_batch_allocr;
 class llama_io_write_i;
 class llama_io_read_i;
 
+class llama_kv_cache;
+
 struct llama_memory_params {
     // kv cache
     ggml_type type_k;
@@ -25,6 +27,9 @@ struct llama_memory_params {
     llama_context_type ctx_type;
 
     llama_memory_t mem_other;
+    uint32_t n_ctx_initial = 0;
+    uint32_t n_ctx_max = 0;
+    std::vector<llama_kv_cache *> * caches = nullptr;
 };
 
 enum llama_memory_status {

@@ -4,6 +4,7 @@
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
+#include "../ggml-backend-sparse.h"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -769,12 +770,27 @@ struct ggml_backend_cuda_buffer_context {
     std::string name;
 
     size_t backing_size;
+    size_t reserved_size = 0;
+    size_t granularity = 0;
+    std::vector<ggml_sparse_chunk> chunks;
+    std::atomic<size_t> committed{0};
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr, size_t backing_size) :
         device(device), dev_ptr(dev_ptr), backing_size(backing_size),
         name(GGML_CUDA_NAME + std::to_string(device)) {
     }
 
     ~ggml_backend_cuda_buffer_context() {
+#if defined(GGML_USE_VMM)
+        if (reserved_size) {
+            for (const auto & chunk : chunks) {
+                CU_CHECK(cuMemUnmap((CUdeviceptr) dev_ptr + chunk.offset, chunk.size));
+                CU_CHECK(cuMemRelease((CUmemGenericAllocationHandle) chunk.handle));
+                ggml_backend_account_allocation(GGML_BACKEND_ALLOCATION_DEVICE, chunk.size, true);
+            }
+            CU_CHECK(cuMemAddressFree((CUdeviceptr) dev_ptr, reserved_size));
+            return;
+        }
+#endif
         CUDA_CHECK(cudaFree(dev_ptr));
         ggml_backend_account_allocation(GGML_BACKEND_ALLOCATION_DEVICE, backing_size, true);
     }
@@ -802,7 +818,7 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
         return GGML_STATUS_SUCCESS;
     }
 
-    if (ggml_is_quantized(tensor->type) && tensor->view_src == nullptr && ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+    if (!ctx->reserved_size && ggml_is_quantized(tensor->type) && tensor->view_src == nullptr && ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
         // initialize padding to 0 to avoid possible NaN values
         const size_t original_size = ggml_nbytes(tensor);
         const size_t padded_size = ggml_backend_buft_get_alloc_size(buffer->buft, tensor);
@@ -888,7 +904,11 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
+    if (ctx->reserved_size) {
+        for (const auto & chunk : ctx->chunks) CUDA_CHECK(cudaMemsetAsync((char *) ctx->dev_ptr + chunk.offset, value, chunk.size, cudaStreamPerThread));
+    } else {
+        CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
+    }
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -976,6 +996,103 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
     return size;
 }
 
+static size_t ggml_cuda_residency_granularity(ggml_backend_buffer_type_t buft) {
+#if defined(GGML_USE_VMM)
+    const int device = ((ggml_backend_cuda_buffer_type_context *) buft->context)->device;
+    if (!ggml_cuda_info().devices[device].vmm) return 0;
+    CUmemAllocationProp prop = {}; prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE; prop.location.id = ggml_cuda_get_physical_device(device);
+    size_t granularity = 0;
+    if (cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM) != CUDA_SUCCESS) return 0;
+    return granularity;
+#else
+    GGML_UNUSED(buft); return 0;
+#endif
+}
+
+static size_t ggml_cuda_reserved_size(ggml_backend_buffer_t buffer) {
+    return ((ggml_backend_cuda_buffer_context *) buffer->context)->committed.load();
+}
+
+static bool ggml_cuda_reserved_update(ggml_backend_buffer_t buffer, const ggml_backend_buffer_range * ranges, size_t count) {
+#if defined(GGML_USE_VMM)
+    auto * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    ggml_cuda_set_device(ctx->device);
+    const int physical_device = ggml_cuda_get_physical_device(ctx->device);
+    bool peer_access = getenv("GGML_CUDA_P2P") != nullptr;
+#if defined(GGML_USE_NCCL)
+    peer_access = true;
+#endif
+    std::vector<CUmemAccessDesc> access_descs;
+    bool physical_seen[GGML_CUDA_MAX_DEVICES] = {};
+    for (int id = 0; id < ggml_cuda_info().device_count; ++id) {
+        const int physical = ggml_cuda_get_physical_device(id);
+        if (physical_seen[physical]) continue;
+        if (physical != physical_device) {
+            int can_access = 0;
+            if (!peer_access || cudaDeviceCanAccessPeer(&can_access, physical, physical_device) != cudaSuccess || !can_access) continue;
+        }
+        physical_seen[physical] = true;
+        CUmemAccessDesc access = {};
+        access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        access.location.id = physical;
+        access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        access_descs.push_back(access);
+    }
+    auto release = [ctx](const ggml_sparse_chunk & chunk) {
+        CU_CHECK(cuMemUnmap((CUdeviceptr) ctx->dev_ptr + chunk.offset, chunk.size));
+        CU_CHECK(cuMemRelease((CUmemGenericAllocationHandle) chunk.handle));
+        ggml_backend_account_allocation(GGML_BACKEND_ALLOCATION_DEVICE, chunk.size, true);
+    };
+    const bool result = ggml_sparse_update(ctx->chunks, ctx->reserved_size, ctx->granularity, ranges, count,
+        [ctx, physical_device, &access_descs](ggml_sparse_chunk & chunk) {
+            CUmemAllocationProp prop = {}; prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+            prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE; prop.location.id = physical_device;
+            CUmemGenericAllocationHandle handle;
+            if (cuMemCreate(&handle, chunk.size, &prop, 0) != CUDA_SUCCESS) return false;
+            const CUdeviceptr address = (CUdeviceptr) ctx->dev_ptr + chunk.offset;
+            if (cuMemMap(address, chunk.size, 0, handle, 0) != CUDA_SUCCESS) { cuMemRelease(handle); return false; }
+            if (cuMemSetAccess(address, chunk.size, access_descs.data(), access_descs.size()) != CUDA_SUCCESS ||
+                cudaMemset((void *) address, 0, chunk.size) != cudaSuccess) {
+                cuMemUnmap(address, chunk.size); cuMemRelease(handle); return false;
+            }
+            chunk.handle = (uint64_t) handle;
+            ggml_backend_account_allocation(GGML_BACKEND_ALLOCATION_DEVICE, chunk.size, false);
+            return true;
+        }, release);
+    ctx->committed = ggml_sparse_size(ctx->chunks);
+    return result;
+#else
+    GGML_UNUSED(buffer); GGML_UNUSED(ranges); GGML_UNUSED(count); return false;
+#endif
+}
+
+static ggml_backend_buffer_t ggml_cuda_reserve_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+#if defined(GGML_USE_VMM)
+    const int device = ((ggml_backend_cuda_buffer_type_context *) buft->context)->device;
+    ggml_cuda_set_device(device);
+    const size_t granularity = ggml_cuda_residency_granularity(buft);
+    if (!granularity) return nullptr;
+    const size_t reserved = GGML_PAD(size, granularity);
+    auto * ctx = new ggml_backend_cuda_buffer_context(device, nullptr, 0);
+    CUdeviceptr address = 0;
+    if (cuMemAddressReserve(&address, reserved, 0, 0, 0) != CUDA_SUCCESS) { delete ctx; return nullptr; }
+    ctx->dev_ptr = (void *) address;
+    ctx->reserved_size = reserved; ctx->granularity = granularity;
+    auto iface = ggml_backend_cuda_buffer_interface;
+    iface.resident_size = ggml_cuda_reserved_size;
+    iface.set_resident_ranges = ggml_cuda_reserved_update;
+    try {
+        return ggml_backend_buffer_init(buft, iface, ctx, size);
+    } catch (...) {
+        delete ctx;
+        throw;
+    }
+#else
+    GGML_UNUSED(buft); GGML_UNUSED(size); return nullptr;
+#endif
+}
+
 static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface = {
     /* .get_name         = */ ggml_backend_cuda_buffer_type_get_name,
     /* .alloc_buffer     = */ ggml_backend_cuda_buffer_type_alloc_buffer,
@@ -983,6 +1100,8 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface 
     /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
     /* .get_alloc_size   = */ ggml_backend_cuda_buffer_type_get_alloc_size,
     /* .is_host          = */ NULL,
+    /* .reserve_buffer   = */ ggml_cuda_reserve_buffer,
+    /* .residency_granularity = */ ggml_cuda_residency_granularity,
 };
 
 ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {

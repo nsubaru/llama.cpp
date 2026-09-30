@@ -1309,13 +1309,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         const int64_t tid = gguf_find_tensor(metadata, tn.str().c_str());
-        if (tid == -1) {
+        if (tid == -1 && !infer_tensor_metadata) {
             if (flags & TENSOR_NOT_REQUIRED) {
                 return nullptr;
             }
             throw std::runtime_error(format("missing tensor '%s'", tn.str().c_str()));
         }
-        const ggml_type type = gguf_get_tensor_type(metadata, tid);
+        // User-created models infer required tensors from their architecture.
+        // Borrowed GGUF buffers still require every tensor in the metadata.
+        const ggml_type type = tid == -1 ? GGML_TYPE_F32 : gguf_get_tensor_type(metadata, tid);
 
         // for tensors that are not required some of the dimensions can be invalid:
         if (flags & TENSOR_NOT_REQUIRED) {
@@ -1343,8 +1345,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
         ggml_set_name(&t_meta, tn.str().c_str());
 
-        const size_t expected_size = gguf_get_tensor_size(metadata, tid);
         const size_t actual_size = ggml_nbytes(&t_meta);
+        const size_t expected_size = tid == -1 ? actual_size : gguf_get_tensor_size(metadata, tid);
         if (expected_size != actual_size) {
             throw std::runtime_error(format("tensor '%s' has wrong size; expected %zu, got %zu", tn.str().c_str(), expected_size, actual_size));
         }
@@ -1431,6 +1433,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 }
 
 void llama_model_loader::done_getting_tensors(bool partial) const {
+    if (infer_tensor_metadata) {
+        return;
+    }
     if (n_created > n_tensors) {
         throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
     }

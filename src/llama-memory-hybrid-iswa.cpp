@@ -29,7 +29,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
-    const layer_filter_cb & filter_recr) :
+    const layer_filter_cb & filter_recr, const llama_memory_params & allocation) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache_iswa(
         model,
@@ -49,7 +49,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
             : filter_attn,
         nullptr,
         nullptr
-    )),
+    , allocation)),
     mem_recr(new llama_memory_recurrent(
         model,
         type_r,

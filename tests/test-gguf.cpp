@@ -1,5 +1,7 @@
 #include "ggml.h"
 #include "llama.h"
+#include "../src/llama-ext.h"
+#include <chrono>
 #include "ggml-cpu.h"
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -22,6 +24,7 @@
 #include <random>
 #include <limits>
 #include <string>
+#include <thread>
 #include <vector>
 
 constexpr int offset_has_kv      = 1000;
@@ -1749,6 +1752,251 @@ static void print_usage() {
     printf("  if no seed is unspecified then a random seed is used\n");
 }
 
+// Stable maximum strides must produce identical state and continuation across live growth.
+static std::pair<int, int> test_live_kv_capacity() {
+    int pass = 0, total = 0;
+    auto check = [&](bool value, const char * name) {
+        ++total;
+        if (value) ++pass;
+        else fprintf(stderr, "live KV: %s failed\n", name);
+    };
+    auto * tensors = ggml_init({1024*1024, nullptr, true});
+    auto * meta = gguf_init_empty();
+    gguf_set_val_str(meta, "general.architecture", "llama");
+    gguf_set_val_str(meta, "tokenizer.ggml.model", "none");
+    gguf_set_val_u32(meta, "llama.vocab_size", 16);
+    gguf_set_val_u32(meta, "llama.context_length", 262144);
+    gguf_set_val_u32(meta, "llama.embedding_length", 128);
+    gguf_set_val_u32(meta, "llama.block_count", 1);
+    gguf_set_val_u32(meta, "llama.feed_forward_length", 256);
+    gguf_set_val_u32(meta, "llama.attention.head_count", 2);
+    gguf_set_val_f32(meta, "llama.attention.layer_norm_rms_epsilon", 1e-5f);
+    size_t payload = 0;
+    auto tensor = [&](const char * name, int64_t a, int64_t b = 1) {
+        auto * t = ggml_new_tensor_2d(tensors, GGML_TYPE_F32, a, b);
+        ggml_set_name(t, name); gguf_add_tensor(meta, t);
+        payload += GGML_PAD(ggml_nbytes(t), gguf_get_alignment(meta));
+    };
+    tensor("token_embd.weight", 128, 16);
+    tensor("output_norm.weight", 128);
+    tensor("output.weight", 128, 16);
+    tensor("blk.0.attn_norm.weight", 128);
+    tensor("blk.0.attn_q.weight", 128, 128);
+    tensor("blk.0.attn_k.weight", 128, 128);
+    tensor("blk.0.attn_v.weight", 128, 128);
+    tensor("blk.0.attn_output.weight", 128, 128);
+    tensor("blk.0.ffn_norm.weight", 128);
+    tensor("blk.0.ffn_gate.weight", 128, 256);
+    tensor("blk.0.ffn_up.weight", 128, 256);
+    tensor("blk.0.ffn_down.weight", 256, 128);
+    const auto header = gguf_get_meta_size(meta);
+    std::vector<uint8_t> blob(header + payload);
+    gguf_get_meta_data(meta, blob.data());
+    std::mt19937 rng(913);
+    std::uniform_real_distribution<float> random(-0.04f, 0.04f);
+    for (int i = 0; i < gguf_get_n_tensors(meta); ++i) {
+        auto * t = ggml_get_tensor(tensors, gguf_get_tensor_name(meta, i));
+        auto * values = (float *) (blob.data() + header + gguf_get_tensor_offset(meta, i));
+        for (int64_t j = 0; j < ggml_nelements(t); ++j)
+            values[j] = strstr(t->name, "norm") ? 1.0f : random(rng);
+    }
+    // Fixture construction infers architecture tensors; copying a real GGUF remains strict.
+    auto mp_cpu = llama_model_default_params();
+    mp_cpu.n_gpu_layers = 0;
+    auto * copied = llama_model_load_from_buffer(blob.data(), blob.size(), mp_cpu);
+    check(copied != nullptr, "copied GGUF keeps optional tensors absent");
+    llama_model_free(copied);
+    auto * metadata_only = gguf_init_empty();
+    gguf_set_kv(metadata_only, meta);
+    auto * inferred = llama_model_init_from_user(metadata_only, [](ggml_tensor * t, void *) {
+        std::vector<uint8_t> zero(ggml_nbytes(t));
+        ggml_backend_tensor_set(t, zero.data(), 0, zero.size());
+    }, nullptr, mp_cpu);
+    check(inferred != nullptr, "synthetic models infer tensor metadata");
+    llama_model_free(inferred);
+    gguf_free(metadata_only);
+    bool has_gpu = false;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i)
+        has_gpu |= ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU;
+    auto state = [](llama_context * ctx) {
+        std::vector<uint8_t> data(llama_state_seq_get_size(ctx, 0));
+        GGML_ASSERT(llama_state_seq_get_data(ctx, data.data(), data.size(), 0) == data.size());
+        return data;
+    };
+    auto cache_bytes = [](llama_context * ctx) {
+        size_t size = 0;
+        for (const auto & entry : llama_get_memory_breakdown(ctx)) size += entry.second.context - entry.second.output;
+        return size;
+    };
+    for (bool gpu : {false, true}) {
+        if (gpu && !has_gpu) continue;
+        auto mp = llama_model_default_params(); mp.n_gpu_layers = gpu ? 99 : 0;
+        auto * model = llama_model_load_from_buffer_view(blob.data(), blob.size(), mp);
+        check(model != nullptr, "random model load");
+        if (!model) continue;
+        for (auto quant : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+            for (bool flash : {false, true}) {
+                if (!flash && quant != GGML_TYPE_F16) continue;
+                auto cp = llama_context_default_params();
+                cp.n_ctx = 1024; cp.n_batch = cp.n_ubatch = 64; cp.n_outputs_max = 1;
+                cp.n_threads = cp.n_threads_batch = 2; cp.offload_kqv = gpu;
+                cp.flash_attn_type = flash ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+                cp.type_k = cp.type_v = quant;
+                auto * fixed = llama_init_from_model(model, cp);
+                cp.n_ctx_initial = 256;
+                auto * growing = llama_init_from_model(model, cp);
+                check(fixed && growing, "context creation for placement/layout/quantization");
+                if (fixed && growing) {
+                    check(llama_n_ctx(growing) == 1024 && llama_n_ctx_allocated(growing) == 256, "logical maximum distinct from backing");
+                    // CUDA allocation granularity can exceed this deliberately tiny fixture.
+                    // Its startup saving is verified separately with the 32K/256K fixture.
+                    if (!gpu) check(cache_bytes(growing) < cache_bytes(fixed), "CPU startup commits less than maximum");
+                    const auto before_plan = state(growing);
+                    const auto initial_bytes = cache_bytes(growing);
+                    const auto maximum_plan = llama_plan_context_capacity(growing, 1024);
+                    size_t maximum_kv = 0;
+                    for (const auto & item : maximum_plan) maximum_kv += item.second.context - item.second.output;
+                    check(initial_bytes <= maximum_kv && cache_bytes(growing) == initial_bytes &&
+                        state(growing) == before_plan && llama_n_ctx_allocated(growing) == 256,
+                        "planning preserves live backing, state and capacity");
+                    bool equivalent = true;
+                    for (int pos = 0; pos < 640 && equivalent; ++pos) {
+                        if (pos >= (int) llama_n_ctx_allocated(growing))
+                            equivalent = llama_set_n_ctx_allocated(growing, ((pos / 256) + 1) * 256);
+                        llama_token tok = pos % 16;
+                        equivalent &= llama_decode(fixed, llama_batch_get_one(&tok, 1)) == 0;
+                        equivalent &= llama_decode(growing, llama_batch_get_one(&tok, 1)) == 0;
+                        auto * a = llama_get_logits(fixed); auto * b = llama_get_logits(growing);
+                        for (int j = 0; j < 16 && equivalent; ++j)
+                            equivalent &= std::isfinite(a[j]) && std::isfinite(b[j]) && std::abs(a[j] - b[j]) < 1e-5f;
+                        if (pos == 127) {
+                            const auto saved = state(growing);
+                            equivalent &= llama_set_n_ctx_allocated(growing, 512);
+                            equivalent &= state(growing) == saved;
+                            equivalent &= llama_set_n_ctx_allocated(growing, 256);
+                            equivalent &= state(growing) == saved;
+                        }
+                    }
+                    check(equivalent, "continuation matches fixed allocation across generation boundaries");
+                    const auto saved = state(growing);
+                    check(saved == state(fixed), "serialized KV values match fixed context");
+                    check(!llama_set_n_ctx_allocated(growing, 256), "cannot release rows holding live tokens");
+                    check(!llama_set_n_ctx_allocated(growing, 1025) && !llama_set_n_ctx_allocated(growing, 0), "exact maximum enforcement");
+                    check(state(growing) == saved, "rejected growth preserves state");
+                    auto * restored = llama_init_from_model(model, cp);
+                    check(restored && llama_set_n_ctx_allocated(restored, 768) &&
+                        llama_state_seq_set_data(restored, saved.data(), saved.size(), 0) == saved.size(), "restore beyond initial capacity");
+                    if (restored) { check(state(restored) == saved, "restored state matches"); llama_free(restored); }
+                }
+                llama_free(growing); llama_free(fixed);
+            }
+        }
+        {
+            std::array<bool, 2> valid = {false, false};
+            std::array<std::vector<uint8_t>, 2> concurrent_states;
+            auto worker = [&](size_t index) {
+                auto cp = llama_context_default_params();
+                cp.n_ctx = 1024; cp.n_ctx_initial = 256; cp.n_batch = cp.n_ubatch = 64;
+                cp.n_outputs_max = 1; cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+                cp.n_threads = cp.n_threads_batch = 2;
+                auto * ctx = llama_init_from_model(model, cp);
+                if (!ctx) return;
+                bool ok = true;
+                std::vector<llama_token> prompt(64, 3);
+                for (uint32_t pos = 0; pos < 768 && ok; pos += 64) {
+                    if (pos + 64 > llama_n_ctx_allocated(ctx)) {
+                        const auto saved = state(ctx);
+                        llama_plan_context_capacity(ctx, pos + 256);
+                        ok = state(ctx) == saved && llama_set_n_ctx_allocated(ctx, pos + 256);
+                    }
+                    if (ok) ok = llama_decode(ctx, llama_batch_get_one(prompt.data(), prompt.size())) == 0;
+                }
+                if (ok && !gpu) {
+                    const auto saved = state(ctx);
+                    ok = llama_set_n_ctx_allocated(ctx, 1024);
+                    llama_set_abort_callback(ctx, [](void *) { return true; }, nullptr);
+                    llama_token tok = 5;
+                    ok = ok && llama_decode(ctx, llama_batch_get_one(&tok, 1)) == 2;
+                    llama_set_abort_callback(ctx, nullptr, nullptr);
+                    ok = ok && llama_state_seq_set_data(ctx, saved.data(), saved.size(), 0) == saved.size() &&
+                            state(ctx) == saved && llama_decode(ctx, llama_batch_get_one(&tok, 1)) == 0;
+                }
+                if (ok) concurrent_states[index] = state(ctx);
+                valid[index] = ok;
+                llama_free(ctx);
+            };
+            std::thread first(worker, 0), second(worker, 1);
+            first.join(); second.join();
+            check(valid[0] && valid[1] && concurrent_states[0] == concurrent_states[1],
+                    gpu ? "concurrent GPU growth" : "concurrent CPU growth and cancelled decode recovery");
+        }
+        if (gpu) {
+            auto cp = llama_context_default_params();
+            cp.n_ctx = 262144; cp.n_ctx_initial = 32768; cp.n_batch = 2048; cp.n_ubatch = 256;
+            cp.n_outputs_max = 1; cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+            cp.n_threads = cp.n_threads_batch = 2;
+            auto * ctx = llama_init_from_model(model, cp);
+            check(ctx != nullptr, "32K GPU benchmark context");
+            if (ctx) {
+                std::vector<llama_token> prompt(2048, 3);
+                bool prefix_ok = true;
+                for (int pos = 0; pos < 32768 && prefix_ok; pos += 2048)
+                    prefix_ok = llama_decode(ctx, llama_batch_get_one(prompt.data(), prompt.size())) == 0;
+                check(prefix_ok, "GPU prefill fills the initial 32K backing");
+                const auto prefix = state(ctx);
+                for (uint32_t capacity : {32768u, 65536u, 131072u, 262144u}) {
+                    const auto start = std::chrono::steady_clock::now();
+                    check(llama_set_n_ctx_allocated(ctx, capacity), "32K/64K/128K/maximum mappings");
+                    const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+                    size_t compute_bytes = 0;
+                    for (const auto & item : llama_get_memory_breakdown(ctx)) compute_bytes += item.second.compute;
+                    fprintf(stderr, "live-kv-benchmark flash=on capacity=%u committed=%zu compute=%zu growth_ms=%.3f\n",
+                            capacity, cache_bytes(ctx), compute_bytes, ms);
+                    check(state(ctx) == prefix, "GPU benchmark growth retains exact KV values");
+                }
+                llama_token tok = 5;
+                check(llama_decode(ctx, llama_batch_get_one(&tok, 1)) == 0, "GPU generation beyond 32K");
+                const auto large_state = state(ctx);
+                auto * restored = llama_init_from_model(model, cp);
+                check(restored && llama_set_n_ctx_allocated(restored, 65536) &&
+                    llama_state_seq_set_data(restored, large_state.data(), large_state.size(), 0) == large_state.size(),
+                    "GPU snapshot restoration beyond 32K");
+                if (restored) {
+                    check(state(restored) == large_state, "large GPU restore retains KV values");
+                    check(llama_decode(ctx, llama_batch_get_one(&tok, 1)) == 0 &&
+                        llama_decode(restored, llama_batch_get_one(&tok, 1)) == 0, "large restored GPU continuation");
+                    bool equivalent = true;
+                    for (int i = 0; i < 16; ++i)
+                        equivalent &= std::abs(llama_get_logits(ctx)[i] - llama_get_logits(restored)[i]) < 1e-5f;
+                    check(equivalent, "large restored GPU logits match");
+                    llama_free(restored);
+                }
+                llama_free(ctx);
+            }
+            cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+            ctx = llama_init_from_model(model, cp);
+            check(ctx != nullptr, "32K transposed GPU benchmark context");
+            if (ctx) {
+                const auto initial_bytes = cache_bytes(ctx);
+                for (uint32_t capacity : {32768u, 65536u, 131072u, 262144u}) {
+                    const auto start = std::chrono::steady_clock::now();
+                    check(llama_set_n_ctx_allocated(ctx, capacity), "transposed 32K/64K/128K/maximum mappings");
+                    const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+                    size_t compute_bytes = 0;
+                    for (const auto & item : llama_get_memory_breakdown(ctx)) compute_bytes += item.second.compute;
+                    fprintf(stderr, "live-kv-benchmark flash=off capacity=%u committed=%zu compute=%zu growth_ms=%.3f\n",
+                            capacity, cache_bytes(ctx), compute_bytes, ms);
+                }
+                check(initial_bytes < cache_bytes(ctx), "large transposed GPU cache saves backing despite page rounding");
+                llama_free(ctx);
+            }
+        }
+        llama_model_free(model);
+    }
+    gguf_free(meta); ggml_free(tensors);
+    return {pass, total};
+}
+
 int main(int argc, char ** argv) {
     if (argc > 2) {
         print_usage();
@@ -1767,6 +2015,9 @@ int main(int argc, char ** argv) {
     {
         auto result = test_expert_parts();
         auto planned = test_memory_plan();
+        auto growing = test_live_kv_capacity();
+        result.first += growing.first;
+        result.second += growing.second;
         result.first += planned.first;
         result.second += planned.second;
         npass += result.first;

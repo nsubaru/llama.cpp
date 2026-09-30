@@ -10,6 +10,11 @@
 
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
+#include "ggml-backend-sparse.h"
+#ifndef _WIN32
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 
@@ -30,6 +35,23 @@
 #include <sys/sysctl.h>
 #endif
 
+
+size_t ggml_backend_buft_get_residency_granularity(ggml_backend_buffer_type_t buft) {
+    return buft->iface.residency_granularity ? buft->iface.residency_granularity(buft) : 0;
+}
+
+ggml_backend_buffer_t ggml_backend_buft_reserve_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    return buft->iface.reserve_buffer ? buft->iface.reserve_buffer(buft, size) : nullptr;
+}
+
+size_t ggml_backend_buffer_get_resident_size(ggml_backend_buffer_t buffer) {
+    return buffer->iface.resident_size ? buffer->iface.resident_size(buffer) : buffer->size;
+}
+
+bool ggml_backend_buffer_set_resident_ranges(ggml_backend_buffer_t buffer,
+        const ggml_backend_buffer_range * ranges, size_t count) {
+    return buffer->iface.set_resident_ranges && buffer->iface.set_resident_ranges(buffer, ranges, count);
+}
 
 // backend buffer type
 
@@ -181,10 +203,10 @@ void ggml_backend_get_buffer_diagnostics(ggml_backend_buffer_diagnostics * resul
         if (buffer->borrowed_storage) { result->borrowed_bytes += buffer->size; continue; }
         auto * device = ggml_backend_buft_get_device(buffer->buft);
         if (ggml_backend_buffer_is_host(buffer)) {
-            result->owned_host_bytes += buffer->size;
+            result->owned_host_bytes += ggml_backend_buffer_get_resident_size(buffer);
             if (device && ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU) result->owned_pinned_bytes += buffer->size;
         } else {
-            result->owned_device_bytes += buffer->size;
+            result->owned_device_bytes += ggml_backend_buffer_get_resident_size(buffer);
         }
         if (buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) result->owned_model_bytes += buffer->size;
     }
@@ -2620,6 +2642,103 @@ static const struct ggml_backend_buffer_i ggml_backend_cpu_buffer_from_ptr_i = {
 
 // this buffer type is defined here to make it available to all backends
 
+struct ggml_cpu_reserved_context {
+    void * address;
+    size_t reserved;
+    std::vector<ggml_sparse_chunk> chunks;
+    std::atomic<size_t> committed{0};
+};
+
+static size_t ggml_cpu_residency_granularity(ggml_backend_buffer_type_t) {
+#ifdef _WIN32
+    SYSTEM_INFO info; GetSystemInfo(&info); return info.dwPageSize;
+#else
+    return (size_t) sysconf(_SC_PAGESIZE);
+#endif
+}
+
+static void ggml_cpu_reserved_release(ggml_cpu_reserved_context * ctx, const ggml_sparse_chunk & chunk) {
+    void * address = (char *) ctx->address + chunk.offset;
+#ifdef _WIN32
+    VirtualFree(address, chunk.size, MEM_DECOMMIT);
+#else
+    mprotect(address, chunk.size, PROT_NONE);
+    madvise(address, chunk.size, MADV_DONTNEED);
+#endif
+}
+
+static void ggml_cpu_reserved_free(ggml_backend_buffer_t buffer) {
+    auto * ctx = (ggml_cpu_reserved_context *) buffer->context;
+    for (const auto & chunk : ctx->chunks) ggml_cpu_reserved_release(ctx, chunk);
+#ifdef _WIN32
+    VirtualFree(ctx->address, 0, MEM_RELEASE);
+#else
+    munmap(ctx->address, ctx->reserved);
+#endif
+    delete ctx;
+}
+
+static void * ggml_cpu_reserved_base(ggml_backend_buffer_t buffer) {
+    return ((ggml_cpu_reserved_context *) buffer->context)->address;
+}
+
+static size_t ggml_cpu_reserved_size(ggml_backend_buffer_t buffer) {
+    return ((ggml_cpu_reserved_context *) buffer->context)->committed.load();
+}
+
+static bool ggml_cpu_reserved_update(ggml_backend_buffer_t buffer, const ggml_backend_buffer_range * ranges, size_t count) {
+    auto * ctx = (ggml_cpu_reserved_context *) buffer->context;
+    const bool result = ggml_sparse_update(ctx->chunks, ctx->reserved, ggml_cpu_residency_granularity(buffer->buft), ranges, count,
+        [ctx](ggml_sparse_chunk & chunk) {
+            void * address = (char *) ctx->address + chunk.offset;
+#ifdef _WIN32
+            if (!VirtualAlloc(address, chunk.size, MEM_COMMIT, PAGE_READWRITE)) return false;
+#else
+            if (mprotect(address, chunk.size, PROT_READ | PROT_WRITE)) return false;
+#endif
+            memset(address, 0, chunk.size);
+            return true;
+        }, [ctx](const ggml_sparse_chunk & chunk) { ggml_cpu_reserved_release(ctx, chunk); });
+    ctx->committed = ggml_sparse_size(ctx->chunks);
+    return result;
+}
+
+static void ggml_cpu_reserved_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    auto * ctx = (ggml_cpu_reserved_context *) buffer->context;
+    for (const auto & chunk : ctx->chunks) memset((char *) ctx->address + chunk.offset, value, chunk.size);
+}
+
+static ggml_backend_buffer_t ggml_cpu_reserve_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    const size_t reserved = GGML_PAD(size, ggml_cpu_residency_granularity(buft));
+    auto * ctx = new ggml_cpu_reserved_context{nullptr, reserved, {}};
+#ifdef _WIN32
+    void * address = VirtualAlloc(nullptr, reserved, MEM_RESERVE, PAGE_NOACCESS);
+#else
+    void * address = mmap(nullptr, reserved, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (address == MAP_FAILED) address = nullptr;
+#endif
+    if (!address) { delete ctx; return nullptr; }
+    ctx->address = address;
+    auto iface = ggml_backend_cpu_buffer_i;
+    iface.free_buffer = ggml_cpu_reserved_free;
+    iface.get_base = ggml_cpu_reserved_base;
+    iface.clear = ggml_cpu_reserved_clear;
+    iface.resident_size = ggml_cpu_reserved_size;
+    iface.set_resident_ranges = ggml_cpu_reserved_update;
+    try {
+        // buffer_init owns the context after constructing its buffer, including registration failure.
+        return ggml_backend_buffer_init(buft, iface, ctx, size);
+    } catch (...) {
+#ifdef _WIN32
+        VirtualFree(address, 0, MEM_RELEASE);
+#else
+        munmap(address, reserved);
+#endif
+        delete ctx;
+        throw;
+    }
+}
+
 static const char * ggml_backend_cpu_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
     return "CPU";
 
@@ -2658,6 +2777,8 @@ ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
             /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
             /* .get_alloc_size   = */ NULL, // defaults to ggml_nbytes
             /* .is_host          = */ ggml_backend_cpu_buffer_type_is_host,
+            /* .reserve_buffer   = */ ggml_cpu_reserve_buffer,
+            /* .residency_granularity = */ ggml_cpu_residency_granularity,
         },
         /* .device  = */ NULL, // FIXME ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
         /* .context = */ NULL,
@@ -2681,6 +2802,8 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_buffer_from_ptr_type(void) {
             /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
             /* .get_alloc_size   = */ NULL, // defaults to ggml_nbytes
             /* .is_host          = */ ggml_backend_cpu_buffer_type_is_host,
+            /* .reserve_buffer   = */ ggml_cpu_reserve_buffer,
+            /* .residency_granularity = */ ggml_cpu_residency_granularity,
         },
         /* .device  = */ NULL, // FIXME ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
         /* .context = */ NULL,

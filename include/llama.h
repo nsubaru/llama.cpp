@@ -358,7 +358,8 @@ extern "C" {
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
     //       https://github.com/ggml-org/llama.cpp/pull/7544
     struct llama_context_params {
-        uint32_t n_ctx;                 // text context, 0 = from model
+        uint32_t n_ctx;                 // logical maximum text context, 0 = from model
+        uint32_t n_ctx_initial;         // initial physical capacity, 0 = fixed allocation; ctx_other sharing is unsupported
         uint32_t n_batch;               // logical maximum batch size that can be submitted to llama_decode
         uint32_t n_ubatch;              // physical maximum batch size
         uint32_t n_seq_max;             // max number of sequences (i.e. distinct states for recurrent models)
@@ -658,6 +659,11 @@ extern "C" {
     //       ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
     LLAMA_API uint32_t llama_n_ctx      (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_ctx_seq  (const struct llama_context * ctx);
+    // Physical capacity per sequence; n_ctx remains the logical maximum.
+    LLAMA_API uint32_t llama_n_ctx_allocated(const struct llama_context * ctx);
+    // Call after reserving the capacity plan and before decoding or restoring larger state.
+    // Failure preserves the previous KV data and capacity. Fixed contexts retain their full allocation.
+    LLAMA_API bool llama_set_n_ctx_allocated(struct llama_context * ctx, uint32_t capacity);
     LLAMA_API uint32_t llama_n_batch    (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);

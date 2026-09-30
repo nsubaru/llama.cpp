@@ -101,7 +101,7 @@ public:
                      uint32_t   n_pad,
                      uint32_t   n_rs_seq,
         const layer_filter_cb & filter,
-        const  layer_reuse_cb & reuse);
+        const  layer_reuse_cb & reuse, const llama_memory_params & allocation = {});
 
     ~llama_kv_cache_dsv4() = default;
 
