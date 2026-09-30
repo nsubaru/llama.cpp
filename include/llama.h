@@ -574,6 +574,46 @@ extern "C" {
         const void * data, size_t size, const struct llama_model_tensor_view * views,
         size_t count, struct llama_model_params params);
 
+    // Metadata-only memory planning ABI. No weight payloads, KV, output or compute arenas are allocated.
+    enum llama_memory_backing {
+        LLAMA_MEMORY_BACKING_CPU = 0,
+        LLAMA_MEMORY_BACKING_DEVICE = 1,
+        LLAMA_MEMORY_BACKING_PINNED = 2,
+    };
+
+    struct llama_memory_plan_buffer {
+        char buffer_name[96];
+        char device_id[96]; // PCI bus id when available; otherwise the backend device name
+        uint32_t backing;
+        uint32_t reserved;
+        uint64_t owned_model_bytes;
+        uint64_t borrowed_model_bytes;
+        uint64_t context_bytes;
+        uint64_t compute_bytes;
+        uint64_t output_bytes;
+        uint64_t scratch_bytes;
+    };
+
+    // Source/toolchain/configuration identity for disposable state caches, including local source edits.
+    LLAMA_API const char * llama_state_get_build_id(void);
+
+    struct llama_memory_plan {
+        uint32_t struct_size; // set to sizeof(llama_memory_plan)
+        uint32_t version;     // set to 1
+        uint32_t n_ctx;
+        uint32_t n_batch;
+        uint32_t n_ubatch;
+        uint32_t buffer_count;
+    };
+
+    // Returns the required buffer record count, or -1 on failure/incompatible ABI.
+    // The source and optional complete expert views are borrowed for this call only.
+    LLAMA_API int32_t llama_memory_plan_from_buffer_view(
+        const void * data, size_t size,
+        const struct llama_model_tensor_view * views, size_t view_count,
+        struct llama_model_params model_params, struct llama_context_params context_params,
+        struct llama_memory_plan * plan, struct llama_memory_plan_buffer * buffers, size_t capacity);
+
     // Load a model from multiple splits (support custom naming scheme)
     // The paths must be in the correct order
     LLAMA_API struct llama_model * llama_model_load_from_splits(

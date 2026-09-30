@@ -1452,6 +1452,11 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// Growth is admitted before calling CUDA; suballocations from retained pools are not charged again.
+void ggml_cuda_reserve_runtime_memory(int device, size_t size);
+void ggml_cuda_release_runtime_memory(int device, size_t size);
+void * ggml_cuda_allocate_runtime_memory(int device, size_t size);
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1548,7 +1553,13 @@ struct ggml_backend_cuda_context {
                 const int cc = ggml_cuda_info().devices[device].cc;
                 cublas_workspace_sizes[device] = (cc >= GGML_CUDA_CC_HOPPER) ? 32 * 1024 * 1024 : 4 * 1024 * 1024;
             }
-            CUDA_CHECK(cudaMalloc(&cublas_workspaces[device][curr_stream_no], cublas_workspace_sizes[device]));
+            try {
+                cublas_workspaces[device][curr_stream_no] = ggml_cuda_allocate_runtime_memory(device, cublas_workspace_sizes[device]);
+            } catch (...) {
+                CUBLAS_CHECK(cublasDestroy(cublas_handles[device][curr_stream_no]));
+                cublas_handles[device][curr_stream_no] = nullptr;
+                throw;
+            }
             CUBLAS_CHECK(cublasSetWorkspace(cublas_handles[device][curr_stream_no], cublas_workspaces[device][curr_stream_no], cublas_workspace_sizes[device]));
 #endif
         }

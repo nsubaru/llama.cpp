@@ -1772,7 +1772,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
         const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
 
-        if (ml.borrowed_buffer_data != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        if (!ml.no_alloc && ml.borrowed_buffer_data != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
             if (!buffer_from_host_ptr_supported || !is_default_buft) {
                 throw std::runtime_error(format("%s: CPU backend cannot create a buffer view from the borrowed model data", __func__));
             }
@@ -1796,6 +1796,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 ggml_backend_buffer_ptr buf(ggml_backend_dev_buffer_from_host_ptr(dev, const_cast<void *>(source), nbytes, nbytes));
                 if (!buf || ggml_backend_tensor_alloc(buf.get(), t, const_cast<void *>(source)) != GGML_STATUS_SUCCESS) {
                     throw std::runtime_error(format("cannot bind tensor '%s' to borrowed storage", ggml_get_name(t)));
+                }
+                ggml_backend_buffer_set_borrowed_storage(buf.get());
+                if (external != ml.borrowed_tensor_views.end()) {
+                    ggml_backend_buffer_set_borrowed_read_only(buf.get());
                 }
                 bufs.emplace_back(std::move(buf));
             }
@@ -1826,6 +1830,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
                 for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
+                    if (ml.borrowed_tensor_views.count(t->name)) ggml_backend_buffer_set_borrowed_read_only(buf);
                 }
             } else {
                 buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
@@ -1950,6 +1955,10 @@ const float * llama_model::tensor_split() const {
 uint32_t llama_model::n_gpu_layers() const {
     // note: plus 1 for the "output" layer
     return params.n_gpu_layers >= 0 ? params.n_gpu_layers : hparams.n_layer_all + 1;
+}
+
+bool llama_model::host_buffers_allowed() const {
+    return !params.no_host;
 }
 
 llama_split_mode llama_model::split_mode() const {

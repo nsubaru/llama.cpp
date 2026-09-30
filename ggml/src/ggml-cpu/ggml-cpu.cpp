@@ -118,6 +118,7 @@ static const char * ggml_backend_cpu_get_name(ggml_backend_t backend) {
 static void ggml_backend_cpu_free(ggml_backend_t backend) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
     delete[] cpu_ctx->work_data;
+    ggml_backend_account_allocation(GGML_BACKEND_ALLOCATION_CPU_SCRATCH, cpu_ctx->work_size, true);
     delete cpu_ctx;
     delete backend;
 }
@@ -130,19 +131,21 @@ struct ggml_backend_plan_cpu {
 static ggml_backend_graph_plan_t ggml_backend_cpu_graph_plan_create(ggml_backend_t backend, const struct ggml_cgraph * cgraph) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
 
-    struct ggml_backend_plan_cpu * cpu_plan = new ggml_backend_plan_cpu;
+    struct ggml_backend_plan_cpu * cpu_plan = new (std::nothrow) ggml_backend_plan_cpu;
+    if (!cpu_plan) return nullptr;
 
     cpu_plan->cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
     cpu_plan->cgraph = *cgraph; // FIXME: deep copy
 
     if (cpu_plan->cplan.work_size > 0) {
-        cpu_plan->cplan.work_data = new uint8_t[cpu_plan->cplan.work_size];
+        cpu_plan->cplan.work_data = new (std::nothrow) uint8_t[cpu_plan->cplan.work_size];
         if (cpu_plan->cplan.work_data == NULL) {
             delete cpu_plan;
             return NULL;
         }
     }
 
+    ggml_backend_account_allocation(GGML_BACKEND_ALLOCATION_CPU_SCRATCH, cpu_plan->cplan.work_size, false);
     cpu_plan->cplan.abort_callback      = cpu_ctx->abort_callback;
     cpu_plan->cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     cpu_plan->cplan.use_ref             = cpu_ctx->use_ref;
@@ -154,6 +157,7 @@ static void ggml_backend_cpu_graph_plan_free(ggml_backend_t backend, ggml_backen
     struct ggml_backend_plan_cpu * cpu_plan = (struct ggml_backend_plan_cpu *)plan;
 
     delete[] cpu_plan->cplan.work_data;
+    ggml_backend_account_allocation(GGML_BACKEND_ALLOCATION_CPU_SCRATCH, cpu_plan->cplan.work_size, true);
     delete cpu_plan;
 
     GGML_UNUSED(backend);
@@ -173,12 +177,14 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
 
     if (cpu_ctx->work_size < cplan.work_size) {
-        delete[] cpu_ctx->work_data;
-        cpu_ctx->work_data = new uint8_t[cplan.work_size];
-        if (cpu_ctx->work_data == NULL) {
-            cpu_ctx->work_size = 0;
+        auto * work_data = new (std::nothrow) uint8_t[cplan.work_size];
+        if (work_data == nullptr) {
             return GGML_STATUS_ALLOC_FAILED;
         }
+        ggml_backend_account_allocation(GGML_BACKEND_ALLOCATION_CPU_SCRATCH, cplan.work_size, false);
+        delete[] cpu_ctx->work_data;
+        ggml_backend_account_allocation(GGML_BACKEND_ALLOCATION_CPU_SCRATCH, cpu_ctx->work_size, true);
+        cpu_ctx->work_data = work_data;
         cpu_ctx->work_size = cplan.work_size;
     }
     cplan.work_data = (uint8_t *)cpu_ctx->work_data;
@@ -652,7 +658,14 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
     GGML_UNUSED(reg);
 }
 
+static size_t ggml_backend_cpu_graph_work_size(const ggml_cgraph * graph, int n_threads) {
+    return ggml_graph_plan(graph, n_threads, nullptr).work_size;
+}
+
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_cpu_graph_work_size") == 0) {
+        return (void *)ggml_backend_cpu_graph_work_size;
+    }
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;
         return (void *)fct;

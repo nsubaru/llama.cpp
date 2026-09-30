@@ -22,6 +22,8 @@
 #include <algorithm>
 #include <unordered_map>
 #include <vector>
+#include <mutex>
+#include <atomic>
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -93,6 +95,102 @@ ggml_backend_dev_t ggml_backend_buft_get_device(ggml_backend_buffer_type_t buft)
 
 // backend buffer
 
+static std::mutex buffer_registry_mutex;
+static std::vector<ggml_backend_buffer_t> buffer_registry;
+static std::atomic<uint64_t> protected_copy_attempts{0};
+static std::mutex allocation_mutex;
+static ggml_backend_allocation_diagnostics allocation_diagnostics{};
+struct runtime_memory_account {
+    ggml_backend_dev_t device = nullptr;
+    uint64_t used = 0;
+    uint64_t limit = UINT64_MAX;
+};
+// Fixed storage makes recording allocator failure independent of another allocation.
+static runtime_memory_account runtime_memory_accounts[256];
+
+static runtime_memory_account * runtime_account(ggml_backend_dev_t device) {
+    for (auto & account : runtime_memory_accounts) {
+        if (account.device == device) return &account;
+        if (!account.device) { account.device = device; return &account; }
+    }
+    return nullptr;
+}
+
+void ggml_backend_get_allocation_diagnostics(ggml_backend_allocation_diagnostics * result) {
+    if (!result) return;
+    std::lock_guard<std::mutex> guard(allocation_mutex);
+    *result = allocation_diagnostics;
+}
+
+void ggml_backend_account_allocation(ggml_backend_allocation_kind kind, size_t bytes, bool release) {
+    GGML_ASSERT(kind >= 0 && kind < GGML_BACKEND_ALLOCATION_COUNT);
+    std::lock_guard<std::mutex> guard(allocation_mutex);
+    auto & current = allocation_diagnostics.current[kind];
+    GGML_ASSERT(!release || current >= bytes);
+    current = release ? current - bytes : current + bytes;
+    allocation_diagnostics.peak[kind] = std::max(allocation_diagnostics.peak[kind], current);
+}
+
+bool ggml_backend_set_runtime_memory_limit(ggml_backend_dev_t device, uint64_t bytes) {
+    if (!device) return false;
+    std::lock_guard<std::mutex> guard(allocation_mutex);
+    auto * account = runtime_account(device);
+    if (!account || account->used > bytes) return false;
+    account->limit = bytes;
+    return true;
+}
+
+bool ggml_backend_reserve_runtime_memory(ggml_backend_dev_t device, size_t bytes) {
+    if (!device) return false;
+    std::lock_guard<std::mutex> guard(allocation_mutex);
+    auto * account = runtime_account(device);
+    if (!account || bytes > account->limit - account->used) return false;
+    account->used += bytes;
+    allocation_diagnostics.runtime_pool_bytes += bytes;
+    allocation_diagnostics.runtime_pool_peak_bytes = std::max(allocation_diagnostics.runtime_pool_peak_bytes,
+        allocation_diagnostics.runtime_pool_bytes);
+    return true;
+}
+
+void ggml_backend_release_runtime_memory(ggml_backend_dev_t device, size_t bytes) {
+    std::lock_guard<std::mutex> guard(allocation_mutex);
+    auto * account = runtime_account(device);
+    GGML_ASSERT(account && account->used >= bytes);
+    account->used -= bytes;
+    allocation_diagnostics.runtime_pool_bytes -= bytes;
+}
+
+bool ggml_backend_is_borrowed_range(const void * data, size_t size) {
+    const uintptr_t start = reinterpret_cast<uintptr_t>(data);
+    if (size > UINTPTR_MAX - start) return true;
+    std::lock_guard<std::mutex> guard(buffer_registry_mutex);
+    for (auto * buffer : buffer_registry) {
+        if (!buffer->borrowed_read_only || buffer->size == 0) continue;
+        const auto base = reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(buffer));
+        if (base <= start ? start - base < buffer->size : base - start < size) return true;
+    }
+    return false;
+}
+
+void ggml_backend_get_buffer_diagnostics(ggml_backend_buffer_diagnostics * result) {
+    if (!result) return;
+    *result = {};
+    std::lock_guard<std::mutex> guard(buffer_registry_mutex);
+    for (auto * buffer : buffer_registry) {
+        if (ggml_backend_buffer_is_multi_buffer(buffer) || ggml_backend_buffer_is_meta(buffer)) continue;
+        if (buffer->borrowed_storage) { result->borrowed_bytes += buffer->size; continue; }
+        auto * device = ggml_backend_buft_get_device(buffer->buft);
+        if (ggml_backend_buffer_is_host(buffer)) {
+            result->owned_host_bytes += buffer->size;
+            if (device && ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU) result->owned_pinned_bytes += buffer->size;
+        } else {
+            result->owned_device_bytes += buffer->size;
+        }
+        if (buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) result->owned_model_bytes += buffer->size;
+    }
+    result->protected_copy_attempts = protected_copy_attempts.load();
+}
+
 ggml_backend_buffer_t ggml_backend_buffer_init(
                ggml_backend_buffer_type_t buft,
         struct ggml_backend_buffer_i      iface,
@@ -103,10 +201,45 @@ ggml_backend_buffer_t ggml_backend_buffer_init(
         /* .buft      = */ buft,
         /* .context   = */ context,
         /* .size      = */ size,
-        /* .usage     = */ GGML_BACKEND_BUFFER_USAGE_ANY
+        /* .usage     = */ GGML_BACKEND_BUFFER_USAGE_ANY,
+        /* .borrowed_read_only = */ false,
+        /* .borrowed_storage   = */ false
     };
 
+    try {
+        std::lock_guard<std::mutex> guard(buffer_registry_mutex);
+        buffer_registry.push_back(buffer);
+    } catch (...) {
+        if (iface.free_buffer) iface.free_buffer(buffer);
+        delete buffer;
+        return nullptr;
+    }
     return buffer;
+}
+
+void ggml_backend_buffer_rebind(ggml_backend_buffer_t buffer, ggml_backend_buffer_type_t buft,
+                               void (*free_buffer)(ggml_backend_buffer_t)) {
+    std::lock_guard<std::mutex> guard(buffer_registry_mutex);
+    buffer->buft = buft;
+    buffer->iface.free_buffer = free_buffer;
+}
+
+void ggml_backend_buffer_set_borrowed_storage(ggml_backend_buffer_t buffer) {
+    std::lock_guard<std::mutex> guard(buffer_registry_mutex);
+    buffer->borrowed_storage = true;
+}
+
+void ggml_backend_buffer_set_borrowed_read_only(ggml_backend_buffer_t buffer) {
+    std::lock_guard<std::mutex> guard(buffer_registry_mutex);
+    buffer->borrowed_read_only = true;
+    buffer->borrowed_storage = true;
+}
+
+bool ggml_backend_tensor_is_borrowed_read_only(const struct ggml_tensor * tensor) {
+    while (tensor->view_src != nullptr) {
+        tensor = tensor->view_src;
+    }
+    return tensor->buffer && tensor->buffer->borrowed_read_only;
 }
 
 const char * ggml_backend_buffer_name(ggml_backend_buffer_t buffer) {
@@ -118,6 +251,10 @@ void ggml_backend_buffer_free(ggml_backend_buffer_t buffer) {
         return;
     }
 
+    {
+        std::lock_guard<std::mutex> guard(buffer_registry_mutex);
+        buffer_registry.erase(std::remove(buffer_registry.begin(), buffer_registry.end(), buffer), buffer_registry.end());
+    }
     if (buffer->iface.free_buffer != NULL) {
         buffer->iface.free_buffer(buffer);
     }
@@ -160,6 +297,7 @@ enum ggml_status ggml_backend_buffer_init_tensor(ggml_backend_buffer_t buffer, s
 
 void ggml_backend_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     GGML_ASSERT(buffer);
+    GGML_ASSERT(!buffer->borrowed_read_only);
     // clear is optional if the buffer is zero-sized
     if (buffer->size == 0) {
         return;
@@ -186,7 +324,7 @@ bool ggml_backend_buffer_is_host(ggml_backend_buffer_t buffer) {
 
 void ggml_backend_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage) {
     GGML_ASSERT(buffer);
-    buffer->usage = usage;
+    { std::lock_guard<std::mutex> guard(buffer_registry_mutex); buffer->usage = usage; }
 
     // FIXME: add a generic callback to the buffer interface
     if (ggml_backend_buffer_is_multi_buffer(buffer)) {
@@ -263,6 +401,7 @@ size_t ggml_backend_get_max_size(ggml_backend_t backend) {
 }
 
 void ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    GGML_ASSERT(!ggml_backend_tensor_is_borrowed_read_only(tensor));
     GGML_ASSERT(backend);
     GGML_ASSERT(tensor);
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
@@ -292,6 +431,7 @@ void ggml_backend_tensor_get_async(ggml_backend_t backend, const struct ggml_ten
 
 void ggml_backend_tensor_set_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size,
             size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    GGML_ASSERT(!ggml_backend_tensor_is_borrowed_read_only(tensor));
     GGML_ASSERT(backend);
     GGML_ASSERT(tensor);
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
@@ -333,6 +473,7 @@ void ggml_backend_tensor_get_2d_async(ggml_backend_t backend, const struct ggml_
 }
 
 void ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    GGML_ASSERT(!ggml_backend_tensor_is_borrowed_read_only(tensor));
     GGML_ASSERT(tensor);
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
     GGML_ASSERT(buf != NULL && "tensor buffer not set");
@@ -364,6 +505,7 @@ void ggml_backend_tensor_get(const struct ggml_tensor * tensor, void * data, siz
 
 void ggml_backend_tensor_set_2d(struct ggml_tensor * tensor, const void * data, size_t offset, size_t size,
             size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    GGML_ASSERT(!ggml_backend_tensor_is_borrowed_read_only(tensor));
     GGML_ASSERT(tensor);
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
     GGML_ASSERT(buf != NULL && "tensor buffer not set");
@@ -407,6 +549,7 @@ void ggml_backend_tensor_get_2d(const struct ggml_tensor * tensor, void * data, 
 }
 
 void ggml_backend_tensor_memset(struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    GGML_ASSERT(!ggml_backend_tensor_is_borrowed_read_only(tensor));
     GGML_ASSERT(tensor);
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
@@ -458,9 +601,23 @@ enum ggml_status ggml_backend_graph_compute(ggml_backend_t backend, struct ggml_
     return err;
 }
 
+static bool ggml_is_view_op(enum ggml_op op);
+
 enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(backend);
-    return backend->iface.graph_compute(backend, cgraph);
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const auto * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_NONE && !ggml_is_view_op(node->op) && ggml_backend_tensor_is_borrowed_read_only(node)) {
+            GGML_LOG_ERROR("%s: graph writes borrowed weight '%s'\n", __func__, node->name);
+            return GGML_STATUS_FAILED;
+        }
+    }
+    try {
+        return backend->iface.graph_compute(backend, cgraph);
+    } catch (const std::bad_alloc &) {
+        GGML_LOG_ERROR("%s: backend workspace allocation or admission failed\n", __func__);
+        return GGML_STATUS_ALLOC_FAILED;
+    }
 }
 
 bool ggml_backend_supports_op(ggml_backend_t backend, const struct ggml_tensor * op) {
@@ -486,6 +643,8 @@ ggml_backend_dev_t ggml_backend_get_device(ggml_backend_t backend) {
 // backend copy
 
 void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor * dst) {
+    GGML_ASSERT(!ggml_backend_tensor_is_borrowed_read_only(src));
+    GGML_ASSERT(!ggml_backend_tensor_is_borrowed_read_only(dst));
     GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");
 
     if (src == dst) {
@@ -509,6 +668,8 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
 }
 
 void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst) {
+    GGML_ASSERT(!ggml_backend_tensor_is_borrowed_read_only(src));
+    GGML_ASSERT(!ggml_backend_tensor_is_borrowed_read_only(dst));
     GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");
 
     if (src == dst) {
@@ -1063,7 +1224,7 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 }
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
-void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+bool ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
@@ -1397,6 +1558,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
 
                 if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                    if (ggml_backend_tensor_is_borrowed_read_only(src)) {
+                        ++protected_copy_attempts;
+                        GGML_LOG_ERROR("%s: borrowed weight '%s' cannot be copied to %s\n", __func__, src->name, ggml_backend_name(sched->backends[cur_backend_id]));
+                        return false;
+                    }
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
@@ -1586,6 +1752,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < sched->n_splits; ++i) {
         sched->splits[i].graph.uid = ggml_graph_next_uid();
     }
+    return true;
 }
 
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
@@ -1958,7 +2125,7 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     sched->is_alloc = false;
 }
 
-void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
+bool ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
     GGML_ASSERT(sizes);
@@ -1967,9 +2134,10 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
 
     ggml_backend_sched_synchronize(sched);
 
-    ggml_backend_sched_split_graph(sched, measure_graph);
+    if (!ggml_backend_sched_split_graph(sched, measure_graph)) return false;
 
     ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
+    return true;
 }
 
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
@@ -1978,7 +2146,7 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
 
     ggml_backend_sched_synchronize(sched);
 
-    ggml_backend_sched_split_graph(sched, measure_graph);
+    if (!ggml_backend_sched_split_graph(sched, measure_graph)) return false;
 
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;
@@ -1997,7 +2165,7 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
-    ggml_backend_sched_split_graph(sched, graph);
+    if (!ggml_backend_sched_split_graph(sched, graph)) return false;
 
     if (!ggml_backend_sched_alloc_splits(sched)) {
         return false;
@@ -2046,6 +2214,20 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+size_t ggml_backend_sched_get_cpu_work_size(ggml_backend_sched_t sched, int n_threads) {
+    size_t size = 0;
+    for (int i = 0; i < sched->n_splits; ++i) {
+        const auto & split = sched->splits[i];
+        auto * device = ggml_backend_get_device(sched->backends[split.backend_id]);
+        if (!device || ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU) continue;
+        auto * reg = ggml_backend_dev_backend_reg(device);
+        using query_t = size_t (*)(const ggml_cgraph *, int);
+        auto query = (query_t)ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_graph_work_size");
+        if (query) size = std::max(size, query(&split.graph, n_threads));
+    }
+    return size;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

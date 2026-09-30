@@ -372,13 +372,17 @@ llama_context::llama_context(
 
         // graph outputs buffer
         {
-            if (output_reserve(params.n_seq_max) < params.n_seq_max) {
+            const uint32_t planned_outputs = model.hparams.no_alloc
+                ? std::max(cparams.n_seq_max, std::min(cparams.n_batch,
+                    ((cparams.n_batch + cparams.n_ubatch - 1) / cparams.n_ubatch) * cparams.n_outputs_max))
+                : params.n_seq_max;
+            if (output_reserve(planned_outputs) < planned_outputs) {
                 throw std::runtime_error("failed to reserve initial output buffer");
             }
 
             LLAMA_LOG_INFO("%s: %10s  output buffer size = %8.2f MiB\n", __func__,
-                    ggml_backend_buffer_name    (buf_output.get()),
-                    ggml_backend_buffer_get_size(buf_output.get()) / 1024.0 / 1024.0);
+                    ggml_backend_buft_name(output_buft),
+                    output_exp_size / 1024.0 / 1024.0);
         }
     }
 
@@ -407,7 +411,7 @@ llama_context::llama_context(
             auto * buft = ggml_backend_get_default_buffer_type(backend.get());
             auto backend_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
 
-            if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty()) {
+            if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && model.host_buffers_allowed() && !model.devices.empty()) {
                 // use the host buffer of the first device CPU for faster transfer of the intermediate state
                 const auto & dev = model.devices[0];
                 auto * host_buft = ggml_backend_dev_host_buffer_type(dev.dev);
@@ -2110,6 +2114,17 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         (logits.size + embd.size + embd_nextn.size + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
         (                                                                         backend_token_count) * sizeof(llama_token);
 
+    output_buft = ggml_backend_cpu_buffer_type();
+    auto * output_dev = model.dev_output();
+    auto * host_buft = output_dev && model.host_buffers_allowed() ? ggml_backend_dev_host_buffer_type(output_dev) : nullptr;
+    if (host_buft) {
+        output_buft = host_buft;
+    }
+    output_exp_size = new_size;
+    if (model.hparams.no_alloc) {
+        return n_outputs_max;
+    }
+
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
     if (!buf_output || prev_size < new_size) {
@@ -2130,14 +2145,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             }
         }
 
-        auto * buft = ggml_backend_cpu_buffer_type();
-        // try to use the host buffer of the device where the output tensor is allocated for faster transfer to system memory
-        auto * output_dev = model.dev_output();
-        auto * output_dev_host_buft = output_dev ? ggml_backend_dev_host_buffer_type(output_dev) : nullptr;
-        if (output_dev_host_buft) {
-            buft = output_dev_host_buft;
-        }
-        buf_output.reset(ggml_backend_buft_alloc_buffer(buft, new_size));
+        buf_output.reset(ggml_backend_buft_alloc_buffer(output_buft, new_size));
         if (buf_output == nullptr) {
             LLAMA_LOG_ERROR("%s: failed to allocate output buffer of size %.2f MiB\n", __func__, new_size / (1024.0 * 1024.0));
             return 0;
@@ -2477,12 +2485,21 @@ ggml_cgraph * llama_context::graph_reserve(
 
     this->n_outputs = save_n_outputs;
 
-    // initialize scheduler with the specified graph
-    if (split_only) {
+    // Metadata planning includes the maximum of every representative graph, including TG.
+    // Never let a retry or graph probe allocate payload backing in metadata-only mode.
+    if (model.hparams.no_alloc) {
+        std::vector<size_t> current(backend_ptrs.size());
+        if (!ggml_backend_sched_reserve_size(sched.get(), gf, current.data())) return nullptr;
+        backend_buf_exp_size.resize(current.size());
+        for (size_t i = 0; i < current.size(); ++i) {
+            backend_buf_exp_size[i] = std::max(backend_buf_exp_size[i], current[i]);
+            if (sizes) sizes[i] = backend_buf_exp_size[i];
+        }
+    } else if (split_only) {
         if (sizes) {
-            ggml_backend_sched_reserve_size(sched.get(), gf, sizes);
+            if (!ggml_backend_sched_reserve_size(sched.get(), gf, sizes)) return nullptr;
         } else {
-            ggml_backend_sched_split_graph(sched.get(), gf);
+            if (!ggml_backend_sched_split_graph(sched.get(), gf)) return nullptr;
         }
     } else if (!ggml_backend_sched_reserve(sched.get(), gf)) {
         GGML_ASSERT(!sizes);
@@ -2490,6 +2507,8 @@ ggml_cgraph * llama_context::graph_reserve(
         return nullptr;
     }
 
+    cpu_work_exp_size = std::max(cpu_work_exp_size, ggml_backend_sched_get_cpu_work_size(sched.get(),
+        std::max(cparams.n_threads, cparams.n_threads_batch)));
     return gf;
 }
 
@@ -3386,6 +3405,13 @@ void llama_context::perf_reset() {
 
 llama_memory_breakdown llama_context::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> ret;
+    ret[ggml_backend_cpu_buffer_type()].compute += cpu_work_exp_size;
+    ret[ggml_backend_cpu_buffer_type()].scratch = cpu_work_exp_size;
+    if (output_buft) {
+        const auto size = model.hparams.no_alloc ? output_exp_size : ggml_backend_buffer_get_size(buf_output.get());
+        ret[output_buft].context += size;
+        ret[output_buft].output = size;
+    }
     for (const auto & [buft, size] : model.memory_breakdown()) {
         ret[buft].model += size;
     }

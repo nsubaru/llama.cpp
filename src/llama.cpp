@@ -681,7 +681,7 @@ struct llama_model * llama_model_load_from_expert_views(const void * data, size_
         const llama_model_tensor_view * views, size_t count, llama_model_params params) {
     try {
         const auto description = describe_expert_parts(data, size);
-        if (count != description.size() || (count && !views) || params.no_alloc) {
+        if (count != description.size() || (count && !views)) {
             throw std::runtime_error("complete expert views are required");
         }
         std::set<std::string> names;
@@ -707,6 +707,57 @@ struct llama_model * llama_model_load_from_expert_views(const void * data, size_
     } catch (const std::exception & e) {
         LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
         return nullptr;
+    }
+}
+
+#include LLAMA_STATE_BUILD_ID_HEADER
+const char * llama_state_get_build_id(void) {
+    return LLAMA_STATE_BUILD_ID;
+}
+
+int32_t llama_memory_plan_from_buffer_view(const void * data, size_t size,
+        const llama_model_tensor_view * views, size_t view_count,
+        llama_model_params model_params, llama_context_params context_params,
+        llama_memory_plan * plan, llama_memory_plan_buffer * buffers, size_t capacity) {
+    if (!plan || plan->struct_size != sizeof(*plan) || plan->version != 1 || (capacity && !buffers)) return -1;
+    plan->buffer_count = 0;
+    try {
+        model_params.no_alloc = true;
+        model_params.check_tensors = false;
+        std::unique_ptr<llama_model, decltype(&llama_model_free)> model(view_count
+            ? llama_model_load_from_expert_views(data, size, views, view_count, model_params)
+            : llama_model_load_from_buffer_view(data, size, model_params), llama_model_free);
+        if (!model) return -1;
+        std::unique_ptr<llama_context, decltype(&llama_free)> context(llama_init_from_model(model.get(), context_params), llama_free);
+        if (!context) return -1;
+        const auto breakdown = llama_get_memory_breakdown(context.get());
+        plan->n_ctx = llama_n_ctx(context.get());
+        plan->n_batch = llama_n_batch(context.get());
+        plan->n_ubatch = llama_n_ubatch(context.get());
+        plan->buffer_count = (uint32_t)breakdown.size();
+        size_t index = 0;
+        for (const auto & [buft, memory] : breakdown) {
+            if (index >= capacity) break;
+            auto & output = buffers[index++];
+            output = {};
+            snprintf(output.buffer_name, sizeof(output.buffer_name), "%s", ggml_backend_buft_name(buft));
+            auto * device = ggml_backend_buft_get_device(buft);
+            ggml_backend_dev_props props = {};
+            if (device) ggml_backend_dev_get_props(device, &props);
+            snprintf(output.device_id, sizeof(output.device_id), "%s", props.device_id ? props.device_id : device ? ggml_backend_dev_name(device) : "CPU");
+            const bool cpu = !device || ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU;
+            output.backing = cpu ? LLAMA_MEMORY_BACKING_CPU : ggml_backend_buft_is_host(buft) ? LLAMA_MEMORY_BACKING_PINNED : LLAMA_MEMORY_BACKING_DEVICE;
+            output.owned_model_bytes = cpu ? 0 : memory.model;
+            output.borrowed_model_bytes = cpu ? memory.model : 0;
+            output.context_bytes = memory.context - memory.output;
+            output.compute_bytes = memory.compute - memory.scratch;
+            output.output_bytes = memory.output;
+            output.scratch_bytes = memory.scratch;
+        }
+        return (int32_t)breakdown.size();
+    } catch (const std::exception & error) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, error.what());
+        return -1;
     }
 }
 

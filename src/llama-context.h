@@ -375,6 +375,9 @@ private:
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
+    ggml_backend_buffer_type_t output_buft = nullptr;
+    size_t output_exp_size = 0;
+    size_t cpu_work_exp_size = 0;
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
