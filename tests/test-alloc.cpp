@@ -1,4 +1,5 @@
 #include "ggml-alloc.h"
+#include "../ggml/src/ggml-backend-sparse.h"
 #include "../ggml/src/ggml-backend-impl.h"
 #include "ggml-cpp.h"
 #include "../ggml/src/ggml-impl.h"
@@ -708,6 +709,39 @@ static void test_runtime_pool_admission() {
     GGML_ASSERT(ggml_backend_set_runtime_memory_limit(device, UINT64_MAX));
 }
 
+static void test_sparse_backing() {
+    auto * type = ggml_backend_cpu_buffer_type();
+    const size_t page = ggml_backend_buft_get_residency_granularity(type);
+    GGML_ASSERT(page > 0);
+    ggml_backend_buffer_ptr buffer(ggml_backend_buft_reserve_buffer(type, 8 * page));
+    GGML_ASSERT(buffer && ggml_backend_buffer_get_size(buffer.get()) == 8 * page);
+    GGML_ASSERT(ggml_backend_buffer_get_resident_size(buffer.get()) == 0);
+    ggml_backend_buffer_range initial[] = {{0, page}, {4 * page, page}};
+    GGML_ASSERT(ggml_backend_buffer_set_resident_ranges(buffer.get(), initial, 2));
+    auto * base = (uint8_t *) ggml_backend_buffer_get_base(buffer.get());
+    base[0] = 17; base[4 * page] = 29;
+    ggml_backend_buffer_range grown[] = {{0, 2 * page}, {4 * page, 2 * page}};
+    GGML_ASSERT(ggml_backend_buffer_set_resident_ranges(buffer.get(), grown, 2));
+    GGML_ASSERT(ggml_backend_buffer_get_base(buffer.get()) == base);
+    GGML_ASSERT(ggml_backend_buffer_get_resident_size(buffer.get()) == 4 * page);
+    GGML_ASSERT(base[0] == 17 && base[4 * page] == 29 && base[page] == 0);
+    GGML_ASSERT(ggml_backend_buffer_set_resident_ranges(buffer.get(), initial, 2));
+    GGML_ASSERT(ggml_backend_buffer_get_resident_size(buffer.get()) == 2 * page);
+    GGML_ASSERT(base[0] == 17 && base[4 * page] == 29);
+    ggml_backend_buffer_range invalid[] = {{0, 9 * page}};
+    GGML_ASSERT(!ggml_backend_buffer_set_resident_ranges(buffer.get(), invalid, 1));
+    GGML_ASSERT(base[0] == 17 && base[4 * page] == 29);
+
+    // Failure after one new mapping releases that mapping, preserving every old page.
+    std::vector<ggml_sparse_chunk> chunks = {{0, page, 1}, {4 * page, page, 2}};
+    int attempts = 0, releases = 0;
+    GGML_ASSERT(!ggml_sparse_update(chunks, 8 * page, page, grown, 2,
+        [&](ggml_sparse_chunk & chunk) { chunk.handle = 3; return ++attempts == 1; },
+        [&](const ggml_sparse_chunk & chunk) { GGML_ASSERT(chunk.handle == 3); ++releases; }));
+    GGML_ASSERT(attempts == 2 && releases == 1 && chunks.size() == 2);
+    GGML_ASSERT(chunks[0].handle == 1 && chunks[1].handle == 2);
+}
+
 int main() {
     run("test_max_size_too_many_tensors", test_max_size_too_many_tensors);
     run("test_max_size_tensor_too_large", test_max_size_tensor_too_large);
@@ -725,5 +759,6 @@ int main() {
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     run("test_borrowed_weights", test_borrowed_weights);
     run("test_runtime_pool_admission", test_runtime_pool_admission);
+    run("test_sparse_backing", test_sparse_backing);
     return 0;
 }

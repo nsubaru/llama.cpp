@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-    #define GGML_BACKEND_API_VERSION 3
+    #define GGML_BACKEND_API_VERSION 4
 
     //
     // Backend buffer type
@@ -26,6 +26,8 @@ extern "C" {
         size_t                (*get_alloc_size)(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor);
         // (optional) check if tensor data is in host memory and uses standard ggml tensor layout (defaults to false)
         bool                  (*is_host)       (ggml_backend_buffer_type_t buft);
+        ggml_backend_buffer_t (*reserve_buffer)(ggml_backend_buffer_type_t buft, size_t size);
+        size_t                (*residency_granularity)(ggml_backend_buffer_type_t buft);
     };
 
     struct ggml_backend_buffer_type {
@@ -64,6 +66,8 @@ extern "C" {
         void         (*clear)        (ggml_backend_buffer_t buffer, uint8_t value);
         // (optional) reset any internal state due to tensor initialization, such as tensor extras
         void         (*reset)        (ggml_backend_buffer_t buffer);
+        size_t       (*resident_size)(ggml_backend_buffer_t buffer);
+        bool         (*set_resident_ranges)(ggml_backend_buffer_t buffer, const struct ggml_backend_buffer_range * ranges, size_t count);
     };
 
     struct ggml_backend_buffer {

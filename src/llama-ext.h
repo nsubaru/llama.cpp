@@ -91,6 +91,8 @@ LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
+// Metadata-only projection, including page padding and growth-dependent compute backing.
+LLAMA_API llama_memory_breakdown llama_plan_context_capacity(struct llama_context * ctx, uint32_t capacity);
 
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0

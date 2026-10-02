@@ -346,8 +346,8 @@ static void dsv4_state_write_k_cache(
     const auto layer_ids = kv->get_layer_ids();
     const uint32_t n_layer = layer_ids.size();
 
-    if (n_rows > kv_size) {
-        throw std::runtime_error("DSV4 K-cache state row count exceeds cache size");
+    if (n_rows > kv->get_allocated_size()) {
+        throw std::runtime_error("DSV4 K-cache state row count exceeds allocated backing");
     }
 
     io.write(&version, sizeof(version));
@@ -387,7 +387,7 @@ static void dsv4_state_read_k_cache(
         LLAMA_LOG_INFO("kv size ref %d kv %d\n", n_rows_ref, kv_size);
         throw std::runtime_error("DSV4 K-cache state size mismatch");
     }
-    if (n_rows_ref > kv_size) {
+    if (n_rows_ref > kv->get_allocated_size()) {
         LLAMA_LOG_INFO("kv rows ref %d kv %d\n", n_rows_ref, kv_size);
         throw std::runtime_error("DSV4 K-cache state size mismatch");
     }
@@ -1221,7 +1221,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
                  uint32_t   n_pad,
                  uint32_t   n_rs_seq,
     const layer_filter_cb & filter,
-    const  layer_reuse_cb & reuse) :
+    const  layer_reuse_cb & reuse, const llama_memory_params & allocation) :
     hparams_raw(model.hparams),
     hparams_csa(model.hparams),
     hparams_hca(model.hparams),
@@ -1255,7 +1255,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     kv_raw = std::make_unique<llama_kv_cache_iswa>(
             model, hparams_raw, type_k, type_v,
             v_trans, offload, swa_full, unified_raw, kv_size, n_seq_max, n_ubatch, n_pad,
-            nullptr, filter_raw, reuse, nullptr);
+            nullptr, filter_raw, reuse, nullptr, allocation);
 
     dsv4_make_k_only(hparams_csa);
     dsv4_make_k_only(hparams_hca);
@@ -1292,7 +1292,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     kv_csa = std::make_unique<llama_kv_cache>(
             model, hparams_csa, type_k, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
+            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr, "", allocation);
 
     LLAMA_LOG_INFO("%s: creating DSV4 HCA compressed KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, DSV4_HCA_RATIO));
@@ -1300,7 +1300,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     kv_hca = std::make_unique<llama_kv_cache>(
             model, hparams_hca, type_k, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_HCA_RATIO), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_hca, nullptr, nullptr);
+            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_hca, nullptr, nullptr, "", allocation);
 
     LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, DSV4_CSA_RATIO));
@@ -1308,7 +1308,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     kv_lid = std::make_unique<llama_kv_cache>(
             model, hparams_lid, type_k, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
+            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr, "", allocation);
 
     LLAMA_LOG_INFO("%s: creating DSV4 CSA compressor state\n", __func__);
 
@@ -1609,11 +1609,11 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
 
         //FIXME : note that we conflate token positions with rows, which is not true for multi-modal case.
         const uint32_t n_rows_csa = seq_id >= 0 ?
-            dsv4_state_n_used_k_rows(pos_max, DSV4_CSA_RATIO, kv_csa->get_size()) : kv_csa->get_size();
+            dsv4_state_n_used_k_rows(pos_max, DSV4_CSA_RATIO, kv_csa->get_allocated_size()) : kv_csa->get_allocated_size();
         const uint32_t n_rows_hca = seq_id >= 0 ?
-            dsv4_state_n_used_k_rows(pos_max, DSV4_HCA_RATIO, kv_hca->get_size()) : kv_hca->get_size();
+            dsv4_state_n_used_k_rows(pos_max, DSV4_HCA_RATIO, kv_hca->get_allocated_size()) : kv_hca->get_allocated_size();
         const uint32_t n_rows_lid = seq_id >= 0 ?
-            dsv4_state_n_used_k_rows(pos_max, DSV4_CSA_RATIO, kv_lid->get_size()) : kv_lid->get_size();
+            dsv4_state_n_used_k_rows(pos_max, DSV4_CSA_RATIO, kv_lid->get_allocated_size()) : kv_lid->get_allocated_size();
 
         dsv4_state_write_k_cache(io, kv_csa.get(), seq_id, flags, n_rows_csa);
         dsv4_state_write_k_cache(io, kv_hca.get(), seq_id, flags, n_rows_hca);
@@ -1739,7 +1739,13 @@ void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
             if (data) {
                 //TODO: do not clear the kv-cache during `seq_rm`, ref: https://github.com/ggml-org/llama.cpp/pull/26490#discussion_r3798143663
                 for (uint32_t il : kv->get_layer_ids()) {
-                    dsv4_clear_tensor_stream(kv->get_k_storage(il), (uint32_t) seq_id);
+                    auto * tensor = kv->get_k_storage(il);
+                    const size_t stream_offset = (size_t) seq_id * tensor->nb[2];
+                    ggml_backend_tensor_memset(tensor, 0, stream_offset, kv->get_allocated_size() * tensor->nb[1]);
+                    // The compressor's dummy write uses the last logical row.
+                    if (kv->get_allocated_size() < kv->get_size()) {
+                        ggml_backend_tensor_memset(tensor, 0, stream_offset + (kv->get_size() - 1) * tensor->nb[1], tensor->nb[1]);
+                    }
                 }
             }
         };
@@ -1783,7 +1789,7 @@ llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(llama_kv_cache_
     kv_swa(kv->get_swa()),
     ctx_base_mem(nullptr),
     ctx_swa_mem(nullptr),
-    n_kv(kv_swa->get_size()),
+    n_kv(kv_swa->get_allocated_size()),
     status(LLAMA_MEMORY_STATUS_SUCCESS) {
     sinfos_read.push_back(dsv4_build_full_sinfo(kv_swa));
     sinfos_write = sinfos_read;
@@ -1796,7 +1802,7 @@ llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(
     kv_swa(kv->get_swa()),
     ctx_base_mem(kv->get_base()->init_update(lctx, optimize)),
     ctx_swa_mem(kv->get_swa()->init_update(lctx, optimize)),
-    n_kv(kv_swa->get_size()),
+    n_kv(kv_swa->get_allocated_size()),
     status(llama_memory_status_combine(ctx_base_mem->get_status(), ctx_swa_mem->get_status())) {
 }
 
@@ -1815,7 +1821,7 @@ llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(
     ctx_base_mem(std::make_unique<llama_kv_cache_context>(
                 kv->get_base(), std::move(sinfos_base_write), this->ubatches_write)),
     ctx_swa_mem(nullptr),
-    n_kv(kv_swa->get_size()),
+    n_kv(kv_swa->get_allocated_size()),
     status(LLAMA_MEMORY_STATUS_SUCCESS) {
 }
 
@@ -1936,7 +1942,7 @@ void llama_kv_cache_dsv4_raw_context::set_input_k_rot(ggml_tensor * dst) const {
 // llama_kv_cache_dsv4_comp_context
 //
 
-llama_kv_cache_dsv4_comp_context::llama_kv_cache_dsv4_comp_context(llama_kv_cache * kv) : kv(kv), n_kv(kv->get_size()) {
+llama_kv_cache_dsv4_comp_context::llama_kv_cache_dsv4_comp_context(llama_kv_cache * kv) : kv(kv), n_kv(kv->get_allocated_size()) {
     const uint32_t n_stream = kv->get_n_stream();
 
     sinfos.resize(1);
@@ -1956,7 +1962,7 @@ llama_kv_cache_dsv4_comp_context::llama_kv_cache_dsv4_comp_context(
     kv(kv),
     sinfos(std::move(sinfos)),
     ubatches(std::move(ubatches)),
-    n_kv(kv->get_size()) {
+    n_kv(kv->get_allocated_size()) {
 }
 
 bool llama_kv_cache_dsv4_comp_context::next() {

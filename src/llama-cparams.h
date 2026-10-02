@@ -10,6 +10,7 @@
 struct llama_cparams {
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence
+    uint32_t n_ctx_allocated; // physically backed capacity for a single sequence
     uint32_t n_batch;
     uint32_t n_ubatch;
     uint32_t n_seq_max;
@@ -53,6 +54,7 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
+    bool training;           // set by llama_opt_init()
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

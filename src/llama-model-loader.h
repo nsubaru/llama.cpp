@@ -131,6 +131,7 @@ struct llama_model_loader {
     struct gguf_context * metadata; // either metadata_ptr.get() or externally set
     llama_model_set_tensor_data_t set_tensor_data;
     void * set_tensor_data_ud;
+    bool infer_tensor_metadata = false;
     const uint8_t * borrowed_buffer_data;
     size_t borrowed_buffer_size;
     std::unordered_map<std::string, llama_model_tensor_view> borrowed_tensor_views;

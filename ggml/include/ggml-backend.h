@@ -56,6 +56,14 @@ extern "C" {
     GGML_API void                           ggml_backend_buffer_free          (ggml_backend_buffer_t buffer);
     GGML_API void *                         ggml_backend_buffer_get_base      (ggml_backend_buffer_t buffer);
     GGML_API size_t                         ggml_backend_buffer_get_size      (ggml_backend_buffer_t buffer);
+
+    // Reserved buffers keep addresses stable while physical backing grows.
+    struct ggml_backend_buffer_range { size_t offset; size_t size; };
+    GGML_API size_t ggml_backend_buft_get_residency_granularity(ggml_backend_buffer_type_t buft);
+    GGML_API ggml_backend_buffer_t ggml_backend_buft_reserve_buffer(ggml_backend_buffer_type_t buft, size_t size);
+    GGML_API size_t ggml_backend_buffer_get_resident_size(ggml_backend_buffer_t buffer);
+    GGML_API bool ggml_backend_buffer_set_resident_ranges(ggml_backend_buffer_t buffer,
+        const struct ggml_backend_buffer_range * ranges, size_t count);
     GGML_API enum ggml_status               ggml_backend_buffer_init_tensor   (ggml_backend_buffer_t buffer, struct ggml_tensor * tensor);
     GGML_API size_t                         ggml_backend_buffer_get_alignment (ggml_backend_buffer_t buffer);
     GGML_API size_t                         ggml_backend_buffer_get_max_size  (ggml_backend_buffer_t buffer);
@@ -428,6 +436,7 @@ extern "C" {
         //   - most tensors have n_segments == 1 and a contiguous slice of the tensor data
         //   - some tensors have an inhomogenenous data layout along the split axis,
         //     those tensors are divided into segments which are each individually split across devices
+        //     (this usually happens when multiple tensors are fused into a single one)
         //   - ne has one entry per segment and device and that segment repeats nr times,
         //     in total when accounting for repetitions the segments add up to ggml_tensor::ne for that axis,
         //     the outer/inner loops are over segments/devices like [seg0_dev0_r0, seg0_dev1_r0, seg0_dev0_r1, seg0_dev1_r1, seg1_dev0_r0, seg1_dev1_r0],
