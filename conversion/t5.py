@@ -25,6 +25,14 @@ class T5Model(TextModel):
         self.shared_token_embeddings_found = False
 
     def set_vocab(self):
+        if self.hparams.get("tokenizer_class") == "ByT5Tokenizer":
+            return self._set_vocab_byt5()
+        tokenizer_config = self.dir_model / "tokenizer_config.json"
+        if tokenizer_config.is_file():
+            with tokenizer_config.open(encoding="utf-8") as f:
+                if json.load(f).get("tokenizer_class") == "ByT5Tokenizer":
+                    return self._set_vocab_byt5()
+
         # to avoid TypeError: Descriptors cannot be created directly
         # exception when importing sentencepiece_model_pb2
         os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
@@ -117,6 +125,29 @@ class T5Model(TextModel):
 
         special_vocab = gguf.SpecialVocab(self.dir_model, n_vocab=len(tokens))
         special_vocab.add_to_gguf(self.gguf_writer)
+
+    def _set_vocab_byt5(self):
+        vocab_size = self.hparams["vocab_size"]
+        if vocab_size < 259:
+            raise ValueError("ByT5 requires three special tokens and 256 byte tokens")
+        tokens = [b"<pad>", b"</s>", b"<unk>"]
+        tokens.extend(f"<0x{i:02X}>".encode("ascii") for i in range(256))
+        tokens.extend(f"<extra_id_{i}>".encode("ascii") for i in range(vocab_size - 259))
+        types = [SentencePieceTokenTypes.CONTROL, SentencePieceTokenTypes.CONTROL, SentencePieceTokenTypes.UNKNOWN]
+        types.extend([SentencePieceTokenTypes.BYTE] * 256)
+        types.extend([SentencePieceTokenTypes.USER_DEFINED] * (vocab_size - 259))
+        self.gguf_writer.add_tokenizer_model("byt5")
+        self.gguf_writer.add_tokenizer_pre("default")
+        self.gguf_writer.add_token_list(tokens)
+        self.gguf_writer.add_token_scores([0.0] * vocab_size)
+        self.gguf_writer.add_token_types(types)
+        self.gguf_writer.add_add_space_prefix(False)
+        self.gguf_writer.add_remove_extra_whitespaces(False)
+        self.gguf_writer.add_add_bos_token(False)
+        self.gguf_writer.add_add_eos_token(True)
+        self.gguf_writer.add_pad_token_id(0)
+        self.gguf_writer.add_eos_token_id(1)
+        self.gguf_writer.add_unk_token_id(2)
 
     def set_gguf_parameters(self):
         if (n_ctx := self.find_hparam(["n_positions"], optional=True)) is None:

@@ -2035,7 +2035,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
             special_sep_id  = LLAMA_TOKEN_NULL;
             special_pad_id  = LLAMA_TOKEN_NULL;
             special_mask_id = LLAMA_TOKEN_NULL;
-        } else if (tokenizer_model == "t5") {
+        } else if (tokenizer_model == "t5" || tokenizer_model == "byt5") {
             type = LLAMA_VOCAB_TYPE_UGM;
 
             // default special tokens
@@ -2444,6 +2444,10 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
             pre_type = LLAMA_VOCAB_PRE_TYPE_DEFAULT;
             add_bos = false;
             add_eos = true;
+            if (tokenizer_model == "byt5") {
+                add_space_prefix = false;
+                clean_spaces = false;
+            }
         } else if (type == LLAMA_VOCAB_TYPE_RWKV) {
             pre_type = LLAMA_VOCAB_PRE_TYPE_DEFAULT;
             add_space_prefix = false;
@@ -3230,7 +3234,11 @@ void llama_vocab::impl::init_tokenizer(enum llama_vocab_type type) {
             tokenizer = std::make_unique<llm_tokenizer_wpm>(vocab);
             break;
         case LLAMA_VOCAB_TYPE_UGM:
-            tokenizer = std::make_unique<llm_tokenizer_ugm>(vocab, precompiled_charsmap);
+            if (tokenizer_model == "byt5") {
+                tokenizer = std::make_unique<llm_tokenizer>();
+            } else {
+                tokenizer = std::make_unique<llm_tokenizer_ugm>(vocab, precompiled_charsmap);
+            }
             break;
         case LLAMA_VOCAB_TYPE_RWKV:
             tokenizer = std::make_unique<llm_tokenizer_rwkv>(vocab);
@@ -3554,7 +3562,10 @@ std::vector<llama_token> llama_vocab::impl::tokenize(
                     GGML_ASSERT(special_bos_id != LLAMA_TOKEN_NULL);
                     output.push_back(special_bos_id);
                 }
-                llm_tokenizer_ugm_session session(vocab, *static_cast<const llm_tokenizer_ugm *>(tokenizer.get()));
+                std::unique_ptr<llm_tokenizer_ugm_session> session;
+                if (tokenizer_model != "byt5") {
+                    session = std::make_unique<llm_tokenizer_ugm_session>(vocab, *static_cast<const llm_tokenizer_ugm *>(tokenizer.get()));
+                }
 
                 for (const auto & fragment : fragment_buffer) {
                     if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_RAW_TEXT) {
@@ -3562,7 +3573,13 @@ std::vector<llama_token> llama_vocab::impl::tokenize(
 #ifdef PRETOKENIZERDEBUG
                         LLAMA_LOG_WARN("TT: (%ld %ld %ld) '%s'\n", text.length(), fragment.offset, fragment.length, text.c_str());
 #endif
-                        session.tokenize(text, output);
+                        if (tokenizer_model == "byt5") {
+                            for (unsigned char byte : text) {
+                                output.push_back(vocab.byte_to_token(byte));
+                            }
+                        } else {
+                            session->tokenize(text, output);
+                        }
                     } else { // if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_TOKEN)
                         output.push_back(fragment.token);
                     }

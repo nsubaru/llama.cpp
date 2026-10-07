@@ -183,6 +183,34 @@ int main(int argc, char **argv) {
             return {};
         }
 
+        char tokenizer_model[32] = {};
+        llama_model_meta_val_str(model, "tokenizer.ggml.model", tokenizer_model, sizeof(tokenizer_model));
+        if (std::string(tokenizer_model) == "byt5") {
+            llama_tests tests;
+            std::string all_bytes;
+            for (int i = 0; i < 256; ++i) {
+                all_bytes.push_back(char(i));
+            }
+            const std::vector<std::string> inputs = {
+                "", "  ", "\t\n", "<eng-us>: hello", "<pad>",
+                "\xc3\xa9\xe6\x97\xa5\xf0\x9f\x98\x80", all_bytes,
+            };
+            for (const auto & input : inputs) {
+                std::vector<llama_token> expected;
+                for (unsigned char byte : input) {
+                    expected.push_back(llama_token(byte) + 3);
+                }
+                tests.emplace(input, expected);
+                auto with_eos = expected;
+                with_eos.push_back(1);
+                if (common_tokenize(ctx, input, true, false) != with_eos) {
+                    fprintf(stderr, "%s: ByT5 EOS handling failed\n", __func__);
+                    exit(1);
+                }
+            }
+            return tests;
+        }
+
         const auto res = read_tests(fname_inp, fname_out);
 
         if (res.empty()) {
