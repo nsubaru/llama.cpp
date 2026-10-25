@@ -7112,7 +7112,12 @@ static void ggml_mul_mat_id_input_grad_compute(struct ggml_tensor * dst, int ith
         memset(output, 0, dst->ne[0] * sizeof(float));
         for (int64_t route = lane; route < ids->ne[0]; route += dst->ne[1]) {
             const int32_t expert = *(const int32_t *) ((const char *) ids->data + route * ids->nb[0] + token * ids->nb[1]);
-            GGML_ASSERT(expert >= 0 && expert < weights->ne[2]);
+            // Forward MUL_MAT_ID writes zero for skipped (negative) expert slots.
+            // Such a slot has no input-gradient contribution and must not read weights.
+            if (expert < 0) {
+                continue;
+            }
+            GGML_ASSERT(expert < weights->ne[2]);
             for (int64_t channel = 0; channel < weights->ne[1]; ++channel) {
                 const float dy = *(const float *) ((const char *) grad->data + channel * grad->nb[0] + route * grad->nb[1] + token * grad->nb[2]);
                 const char * source = (const char *) weights->data + channel * weights->nb[1] + expert * weights->nb[2];
