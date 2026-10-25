@@ -9,6 +9,17 @@ extern "C" {
     struct llama_adapter_training;
     struct llama_adapter_optimizer;
 
+    // Classifies a failed graph initialization or compute without parsing diagnostic text.
+    // RESOURCE_EXHAUSTED permits a caller to release the failed context and retry with fewer workers.
+    // A retry must keep the complete sequence, adapter, objective and uncommitted optimizer state.
+    enum llama_adapter_training_failure {
+        LLAMA_ADAPTER_TRAINING_FAILURE_NONE = 0,
+        LLAMA_ADAPTER_TRAINING_FAILURE_INVALID,
+        LLAMA_ADAPTER_TRAINING_FAILURE_RESOURCE_EXHAUSTED,
+        LLAMA_ADAPTER_TRAINING_FAILURE_CANCELLED,
+        LLAMA_ADAPTER_TRAINING_FAILURE_STORAGE,
+    };
+
     // Experimental CPU training for one complete causal Qwen3Next sequence.
     // Use the checkpointed initializer for layer recomputation and optional external activation storage.
     struct llama_adapter_training_params {
@@ -48,6 +59,13 @@ extern "C" {
             struct llama_adapter_training_params params, const struct llama_adapter_checkpoint_store * store,
             char * error, size_t error_capacity);
 
+    // Same checkpointed initializer, with an optional typed failure output. Success writes NONE.
+    // No weights or optimizer accumulation are changed when initialization fails.
+    LLAMA_API struct llama_adapter_training * llama_adapter_training_init_checkpointed_ex(
+            struct llama_model * model, struct llama_adapter_lora * adapter,
+            struct llama_adapter_training_params params, const struct llama_adapter_checkpoint_store * store,
+            enum llama_adapter_training_failure * failure, char * error, size_t error_capacity);
+
     LLAMA_API void llama_adapter_training_free(struct llama_adapter_training * training);
 
     // Charged workspace bytes. This is not resident memory or process commit; mapped base pages are excluded.
@@ -76,6 +94,11 @@ extern "C" {
 
     // Error from the most recent compute call, or an empty string. The pointer lives until the next call or destruction.
     LLAMA_API const char * llama_adapter_training_error(const struct llama_adapter_training * training);
+
+    // Failure from the most recent compute, NONE after success, or INVALID for a null context.
+    // Storage cleanup failure overrides an otherwise retryable allocation failure.
+    LLAMA_API enum llama_adapter_training_failure llama_adapter_training_failure_code(const struct llama_adapter_training * training);
+
 
     struct llama_adapter_optimizer_params {
         float beta1;

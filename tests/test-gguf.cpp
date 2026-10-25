@@ -2383,6 +2383,7 @@ static std::pair<int, int> test_qwen_training() {
         check(fabs(inference_loss(adapter) - first_loss) < 2e-5, "loss matches inference with F32 caches");
         check(!llama_adapter_training_compute(training, tokens, labels, &loss, [](void *) { return true; }, nullptr) &&
             llama_adapter_training_gradient(training, first->name, nullptr, 0) == 0, "cancellation invalidates gradients");
+        check(llama_adapter_training_failure_code(training) == LLAMA_ADAPTER_TRAINING_FAILURE_CANCELLED, "cancelled compute is never retryable allocation failure");
         int abort_count = 0;
         check(!llama_adapter_training_compute(training, tokens, labels, &loss, [](void * count) { return ++*(int *) count >= 4; }, &abort_count) &&
             abort_count >= 4 && llama_adapter_training_gradient(training, first->name, nullptr, 0) == 0, "cancellation during graph execution");
@@ -2390,10 +2391,26 @@ static std::pair<int, int> test_qwen_training() {
         check(!llama_adapter_training_compute(training, tokens, invalid_labels, &loss, nullptr, nullptr), "reject entirely masked sequence");
         invalid_labels[0] = 8;
         check(!llama_adapter_training_compute(training, tokens, invalid_labels, &loss, nullptr, nullptr), "reject invalid target token");
+        check(llama_adapter_training_failure_code(training) == LLAMA_ADAPTER_TRAINING_FAILURE_INVALID, "invalid label failure classification");
         check(llama_adapter_training_compute(training, tokens, labels, &loss, nullptr, nullptr) && loss == first_loss, "repeat starts with fresh recurrent state");
+        check(llama_adapter_training_failure_code(training) == LLAMA_ADAPTER_TRAINING_FAILURE_NONE, "successful compute resets previous failure classification");
         float guard = 123.0f;
         check(llama_adapter_training_gradient(training, first->name, &guard, 1) == gradient.size() && guard == 123.0f, "undersized gradient destination untouched");
-        auto * recomputed = llama_adapter_training_init_checkpointed(model, adapter, config, nullptr, error, sizeof(error));
+        llama_adapter_training_failure failure = LLAMA_ADAPTER_TRAINING_FAILURE_INVALID;
+        auto * recomputed = llama_adapter_training_init_checkpointed_ex(model, adapter, config, nullptr, &failure, error, sizeof(error));
+        check(failure == LLAMA_ADAPTER_TRAINING_FAILURE_NONE && !*error, "successful initialization clears failure classification");
+        auto impossible = config;
+        impossible.workspace_budget_bytes = 1;
+        auto * refused = llama_adapter_training_init_checkpointed_ex(model, adapter, impossible, nullptr, &failure, error, sizeof(error));
+        check(!refused && failure == LLAMA_ADAPTER_TRAINING_FAILURE_RESOURCE_EXHAUSTED && *error,
+            "insufficient workspace is a typed recoverable resource failure");
+        llama_adapter_training_free(refused);
+        impossible = config;
+        impossible.n_tokens = 0;
+        refused = llama_adapter_training_init_checkpointed_ex(model, adapter, impossible, nullptr, &failure, error, sizeof(error));
+        check(!refused && failure == LLAMA_ADAPTER_TRAINING_FAILURE_INVALID, "invalid configuration is not a resource failure");
+        llama_adapter_training_free(refused);
+        check(llama_adapter_training_failure_code(nullptr) == LLAMA_ADAPTER_TRAINING_FAILURE_INVALID, "null context failure classification");
         check(recomputed != nullptr, "preflight layer recomputation");
         if (!recomputed) fprintf(stderr, "recomputation: %s\n", error);
         auto equivalent = [&](llama_adapter_training * candidate) {
@@ -2462,19 +2479,24 @@ static std::pair<int, int> test_qwen_training() {
         store.fail_write = true;
         check(!llama_adapter_training_compute(spilled, tokens, labels, &loss, nullptr, nullptr) && store.files.empty() &&
             llama_adapter_training_gradient(spilled, first->name, nullptr, 0) == 0, "checkpoint write failure invalidates gradients");
+        check(llama_adapter_training_failure_code(spilled) == LLAMA_ADAPTER_TRAINING_FAILURE_STORAGE, "write failure is never retryable allocation failure");
         store.fail_write = false;
         store.fail_read = true;
         check(!llama_adapter_training_compute(spilled, tokens, labels, &loss, nullptr, nullptr) && store.files.empty() &&
             llama_adapter_training_gradient(spilled, first->name, nullptr, 0) == 0, "checkpoint read failure cleans partial run");
+        check(llama_adapter_training_failure_code(spilled) == LLAMA_ADAPTER_TRAINING_FAILURE_STORAGE, "read failure classification");
         store.fail_read = false;
         check(!llama_adapter_training_compute(spilled, tokens, labels, &loss, [](void * data) {
             return !((boundary_store *) data)->files.empty();
         }, &store) && store.files.empty(), "cancellation releases written layer checkpoints");
+        check(llama_adapter_training_failure_code(spilled) == LLAMA_ADAPTER_TRAINING_FAILURE_CANCELLED, "checkpointed cancellation classification");
         store.fail_clear = true;
         check(!llama_adapter_training_compute(spilled, tokens, labels, &loss, nullptr, nullptr) && store.files.empty() &&
             llama_adapter_training_gradient(spilled, first->name, nullptr, 0) == 0, "post-compute cleanup failure invalidates gradients");
+        check(llama_adapter_training_failure_code(spilled) == LLAMA_ADAPTER_TRAINING_FAILURE_STORAGE, "cleanup failure classification");
         store.fail_clear = false;
         check(equivalent(spilled), "fresh checkpointed run recovers after failed attempts");
+        check(llama_adapter_training_failure_code(spilled) == LLAMA_ADAPTER_TRAINING_FAILURE_NONE, "checkpointed success clears failure classification");
         llama_adapter_training_free(spilled);
         llama_adapter_training_free(recomputed);
         const char * late_target = "blk.2.attn_output.weight";
