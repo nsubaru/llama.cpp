@@ -125,11 +125,14 @@ static void validate_training_model(llama_model * model, llama_adapter_lora * ad
 }
 
 static llama_adapter_training * training_init_graph(llama_model * model, llama_adapter_lora * adapter,
-        llama_adapter_training_params params, int layer, char * error, size_t error_capacity, bool allocate = true, llama_adapter_training_failure * failure = nullptr) {
+        llama_adapter_training_params params, int layer, char * error, size_t error_capacity, bool allocate = true,
+        llama_adapter_training_failure * failure = nullptr, uint32_t output_tokens = 0) {
     if (failure) *failure = LLAMA_ADAPTER_TRAINING_FAILURE_NONE;
     if (error && error_capacity) error[0] = '\0';
     try {
         validate_training_model(model, adapter, params);
+        if (output_tokens > params.n_tokens || (output_tokens && layer != (int) model->hparams.n_layer()))
+            throw std::runtime_error("compacted outputs require an isolated training head");
         const size_t max_nodes = 2048 + 4096*(layer < 0 ? model->hparams.n_layer() : 1) + 8*adapter->ab_map.size();
         const size_t metadata = max_nodes*ggml_tensor_overhead() + ggml_graph_overhead_custom(max_nodes, true) +
             ggml_graph_overhead_custom(max_nodes, false);
@@ -155,7 +158,7 @@ static llama_adapter_training * training_init_graph(llama_model * model, llama_a
         p.cvec = &t->cvec;
         p.loras = &t->loras;
         p.res = t->result.get();
-        p.n_outputs = params.n_tokens;
+        p.n_outputs = output_tokens ? output_tokens : params.n_tokens;
         p.ubatch.b_equal_seqs = true;
         p.ubatch.n_tokens = p.ubatch.n_seq_tokens = params.n_tokens;
         p.ubatch.n_seqs = p.ubatch.n_seqs_unq = p.ubatch.n_pos = 1;
@@ -181,7 +184,7 @@ static llama_adapter_training * training_init_graph(llama_model * model, llama_a
             t->loss = ggml_sum(ctx, ggml_mul(ctx, output, t->upstream_tensor));
             forward_output = output;
         } else {
-            t->labels = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, params.n_tokens);
+            t->labels = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, p.n_outputs);
             t->loss = ggml_cross_entropy_loss_sparse(ctx, t->result->get_logits(), t->labels);
             forward_output = t->loss;
         }
@@ -259,6 +262,8 @@ llama_adapter_training * llama_adapter_training_init_checkpointed_ex(llama_model
         const size_t boundary_bytes = elements*sizeof(float);
         const size_t gradient_metadata = 2*adapter->ab_map.size()*ggml_tensor_overhead();
         size_t retained = checked_add(gradient_metadata, boundary_bytes*2);
+        // Labels and ordered output indices remain bounded by the original sequence.
+        retained = checked_add(retained, (size_t) params.n_tokens*(sizeof(llama_token) + sizeof(int32_t)));
         if (!store) retained = checked_add(retained, boundary_bytes*(model->hparams.n_layer()-1));
         for (const auto & entry : adapter->ab_map) for (auto * p : {entry.second.a, entry.second.b}) retained = checked_add(retained, ggml_nbytes(p));
         if (retained >= params.workspace_budget_bytes) throw training_failure(LLAMA_ADAPTER_TRAINING_FAILURE_RESOURCE_EXHAUSTED, "layer boundaries and adapter gradients exceed workspace budget");
@@ -312,6 +317,15 @@ static float compute_checkpointed(llama_adapter_training * t, const llama_token 
         ggml_abort_callback abort_callback, void * abort_data, bool gradients) {
     const size_t bytes = t->boundary.size()*sizeof(float);
     const uint32_t layers = t->model->hparams.n_layer();
+    std::vector<int32_t> output_ids(t->config.n_tokens);
+    std::vector<llama_token> output_labels(t->config.n_tokens);
+    uint32_t output_tokens = 0;
+    for (uint32_t i = 0; i < t->config.n_tokens; ++i) {
+        if (labels[i] != -1) {
+            output_ids[output_tokens] = i;
+            output_labels[output_tokens++] = labels[i];
+        }
+    }
     auto stage_params = t->config;
     stage_params.workspace_budget_bytes -= t->retained_workspace;
     auto cancelled = [&]() { if (abort_callback && abort_callback(abort_data)) throw training_failure(LLAMA_ADAPTER_TRAINING_FAILURE_CANCELLED, "training compute cancelled"); };
@@ -327,7 +341,8 @@ static float compute_checkpointed(llama_adapter_training * t, const llama_token 
         cancelled();
         char reason[256];
         llama_adapter_training_failure stage_failure;
-        std::unique_ptr<llama_adapter_training> stage(training_init_graph(t->model, t->adapter, stage_params, layer, reason, sizeof(reason), true, &stage_failure));
+        std::unique_ptr<llama_adapter_training> stage(training_init_graph(t->model, t->adapter, stage_params, layer, reason, sizeof(reason),
+            true, &stage_failure, layer == layers ? output_tokens : 0));
         if (!stage) throw training_failure(stage_failure, std::string("layer execution: ")+reason);
         std::copy(tokens, tokens+t->config.n_tokens, stage->tokens.begin());
         stage->result->set_inputs(&stage->graph_params.ubatch);
@@ -367,7 +382,8 @@ static float compute_checkpointed(llama_adapter_training * t, const llama_token 
     float loss;
     {
         auto head = build(layers);
-        ggml_backend_tensor_set(head->labels, labels, 0, t->config.n_tokens*sizeof(llama_token));
+        ggml_backend_tensor_set(head->result->t_training_output_ids, output_ids.data(), 0, output_tokens*sizeof(int32_t));
+        ggml_backend_tensor_set(head->labels, output_labels.data(), 0, output_tokens*sizeof(llama_token));
         execute(head.get(), gradients);
         loss = *(float *) head->loss->data;
         if (gradients) copy_gradients(head.get());

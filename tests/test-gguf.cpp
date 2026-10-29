@@ -2497,6 +2497,37 @@ static std::pair<int, int> test_qwen_training() {
         store.fail_clear = false;
         check(equivalent(spilled), "fresh checkpointed run recovers after failed attempts");
         check(llama_adapter_training_failure_code(spilled) == LLAMA_ADAPTER_TRAINING_FAILURE_NONE, "checkpointed success clears failure classification");
+        const llama_token objectives[][4] = {
+            {1, -1, -1, -1}, {-1, -1, -1, 0}, {-1, 2, -1, -1},
+            {1, -1, 3, -1}, {1, 2, 3, 0}, {-1, -1, -1, 0}
+        };
+        for (const auto & objective : objectives) {
+            float dense_loss = NAN;
+            check(llama_adapter_training_compute(training, tokens, objective, &dense_loss, nullptr, nullptr), "dense changing-mask objective");
+            for (auto * candidate : {recomputed, spilled}) {
+                float compact_loss = NAN;
+                bool same = candidate && llama_adapter_training_compute(candidate, tokens, objective, &compact_loss, nullptr, nullptr);
+                same &= fabsf(compact_loss-dense_loss) < 2e-6f;
+                for (const auto & entry : adapter->ab_map) for (auto * p : {entry.second.a, entry.second.b}) {
+                    std::vector<float> reference(ggml_nelements(p)), actual(reference.size());
+                    same &= llama_adapter_training_gradient(training, p->name, reference.data(), reference.size()) == reference.size();
+                    same &= llama_adapter_training_gradient(candidate, p->name, actual.data(), actual.size()) == actual.size();
+                    double reference_energy = 0, difference_energy = 0;
+                    for (size_t i = 0; i < reference.size(); ++i) {
+                        reference_energy += (double) reference[i]*reference[i];
+                        const double difference = (double) actual[i]-reference[i];
+                        difference_energy += difference*difference;
+                    }
+                    same &= sqrt(difference_energy) <= 5e-4*sqrt(reference_energy)+1e-8;
+                }
+                check(same && store.files.empty(), "compacted head preserves every gradient for changing supervised positions");
+                const auto reads = store.read, writes = store.written;
+                check(llama_adapter_training_evaluate(candidate, tokens, objective, &compact_loss, nullptr, nullptr) &&
+                    fabsf(compact_loss-dense_loss) < 2e-6f && store.read == reads && store.written == writes && store.files.empty(),
+                    "compacted forward loss needs no saved activation boundaries");
+            }
+        }
+        check(llama_adapter_training_compute(training, tokens, labels, &loss, nullptr, nullptr), "restore original dense objective after mask comparisons");
         llama_adapter_training_free(spilled);
         llama_adapter_training_free(recomputed);
         const char * late_target = "blk.2.attn_output.weight";

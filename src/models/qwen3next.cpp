@@ -230,6 +230,17 @@ llama_model_qwen3next::graph::graph(const llama_model & model, const llm_graph_p
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
+    // Keep the complete sequence through every decoder layer. Only the isolated
+    // training head can gather supervised positions; GET_ROWS_BACK scatters its
+    // derivative into the original full-sequence layer boundary.
+    if (segmented && first_layer == n_layer) {
+        auto * output_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, params.n_outputs);
+        ggml_set_input(output_ids);
+        ggml_set_name(output_ids, "training.output_ids");
+        res->t_training_output_ids = output_ids;
+        cur = ggml_get_rows(ctx0, cur, output_ids);
+    }
+
     // LM head
     cur = build_lora_mm(model.output, cur, model.output_s);
 
