@@ -55,7 +55,7 @@ struct llama_adapter_training {
 };
 
 static float compute_checkpointed(llama_adapter_training * t, const llama_token * tokens, const llama_token * labels,
-        ggml_abort_callback abort_callback, void * abort_data);
+        ggml_abort_callback abort_callback, void * abort_data, bool gradients);
 
 class training_failure : public std::runtime_error {
 public:
@@ -132,7 +132,7 @@ static llama_adapter_training * training_init_graph(llama_model * model, llama_a
         validate_training_model(model, adapter, params);
         const size_t max_nodes = 2048 + 4096*(layer < 0 ? model->hparams.n_layer() : 1) + 8*adapter->ab_map.size();
         const size_t metadata = max_nodes*ggml_tensor_overhead() + ggml_graph_overhead_custom(max_nodes, true) +
-            (layer >= 0 ? ggml_graph_overhead_custom(max_nodes, false) : 0);
+            ggml_graph_overhead_custom(max_nodes, false);
         if (metadata > params.workspace_budget_bytes) throw training_failure(LLAMA_ADAPTER_TRAINING_FAILURE_RESOURCE_EXHAUSTED, "training graph metadata exceeds workspace budget");
         std::unique_ptr<llama_adapter_training> t(new llama_adapter_training());
         t->error.reserve(512);
@@ -174,19 +174,22 @@ static llama_adapter_training * training_init_graph(llama_model * model, llama_a
         c.yarn_beta_slow = p.hparams.yarn_beta_slow;
         auto * graph = model->build_graph(p);
         auto * ctx = t->result->get_ctx();
+        ggml_tensor * forward_output;
         if (layer >= 0 && layer < (int) model->hparams.n_layer()) {
             auto * output = t->result->t_training_output;
             t->upstream_tensor = ggml_dup_tensor(ctx, output);
             t->loss = ggml_sum(ctx, ggml_mul(ctx, output, t->upstream_tensor));
-            t->forward_metadata.resize(ggml_graph_overhead_custom(max_nodes, false));
-            t->forward_context.reset(ggml_init({t->forward_metadata.size(), t->forward_metadata.data(), true}));
-            if (!t->forward_context) throw training_failure(LLAMA_ADAPTER_TRAINING_FAILURE_RESOURCE_EXHAUSTED, "cannot allocate forward graph metadata");
-            t->forward = ggml_new_graph_custom(t->forward_context.get(), max_nodes, false);
-            ggml_build_forward_expand(t->forward, output);
+            forward_output = output;
         } else {
             t->labels = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, params.n_tokens);
             t->loss = ggml_cross_entropy_loss_sparse(ctx, t->result->get_logits(), t->labels);
+            forward_output = t->loss;
         }
+        t->forward_metadata.resize(ggml_graph_overhead_custom(max_nodes, false));
+        t->forward_context.reset(ggml_init({t->forward_metadata.size(), t->forward_metadata.data(), true}));
+        if (!t->forward_context) throw training_failure(LLAMA_ADAPTER_TRAINING_FAILURE_RESOURCE_EXHAUSTED, "cannot allocate forward graph metadata");
+        t->forward = ggml_new_graph_custom(t->forward_context.get(), max_nodes, false);
+        ggml_build_forward_expand(t->forward, forward_output);
         ggml_set_loss(t->loss);
         ggml_build_forward_expand(graph, t->loss);
         bool has_parameters = false;
@@ -306,7 +309,7 @@ llama_adapter_training * llama_adapter_training_init_checkpointed_ex(llama_model
 }
 
 static float compute_checkpointed(llama_adapter_training * t, const llama_token * tokens, const llama_token * labels,
-        ggml_abort_callback abort_callback, void * abort_data) {
+        ggml_abort_callback abort_callback, void * abort_data, bool gradients) {
     const size_t bytes = t->boundary.size()*sizeof(float);
     const uint32_t layers = t->model->hparams.n_layer();
     auto stage_params = t->config;
@@ -353,7 +356,7 @@ static float compute_checkpointed(llama_adapter_training * t, const llama_token 
         execute(stage.get(), false);
         ggml_backend_tensor_get(stage->result->t_training_output, t->boundary.data(), 0, bytes);
         for (float value : t->boundary) if (!std::isfinite(value)) throw std::runtime_error("nonfinite layer boundary");
-        if (layer+1 < layers) {
+        if (gradients && layer+1 < layers) {
             if (t->store.write) {
                 if (!t->store.write(t->store.user_data, layer+1, t->boundary.data(), bytes)) throw training_failure(LLAMA_ADAPTER_TRAINING_FAILURE_STORAGE, "activation checkpoint write failed");
             } else {
@@ -365,10 +368,11 @@ static float compute_checkpointed(llama_adapter_training * t, const llama_token 
     {
         auto head = build(layers);
         ggml_backend_tensor_set(head->labels, labels, 0, t->config.n_tokens*sizeof(llama_token));
-        execute(head.get(), true);
+        execute(head.get(), gradients);
         loss = *(float *) head->loss->data;
-        copy_gradients(head.get());
+        if (gradients) copy_gradients(head.get());
     }
+    if (!gradients) return loss;
     for (int layer = (int) layers-1; layer >= 0; --layer) {
         cancelled();
         if (layer > 0) read(layer);
@@ -388,8 +392,8 @@ size_t llama_adapter_training_checkpoint_size(const llama_adapter_training * tra
     return training && training->checkpointed ? training->boundary.size()*sizeof(float)*(training->model->hparams.n_layer()-1) : 0;
 }
 
-bool llama_adapter_training_compute(llama_adapter_training * t, const llama_token * tokens, const llama_token * labels,
-        float * loss, ggml_abort_callback abort_callback, void * abort_data) {
+static bool compute_loss(llama_adapter_training * t, const llama_token * tokens, const llama_token * labels,
+        float * loss, ggml_abort_callback abort_callback, void * abort_data, bool gradients) {
     if (!t) return false;
     t->valid = false;
     t->consumed = false;
@@ -417,7 +421,7 @@ bool llama_adapter_training_compute(llama_adapter_training * t, const llama_toke
         if (abort_callback && abort_callback(abort_data)) throw training_failure(LLAMA_ADAPTER_TRAINING_FAILURE_CANCELLED, "training compute cancelled");
         float value;
         if (t->checkpointed) {
-            value = compute_checkpointed(t, tokens, labels, abort_callback, abort_data);
+            value = compute_checkpointed(t, tokens, labels, abort_callback, abort_data, gradients);
         } else {
             std::copy(tokens, tokens + t->config.n_tokens, t->tokens.begin());
             t->result->set_inputs(&t->graph_params.ubatch);
@@ -425,14 +429,14 @@ bool llama_adapter_training_compute(llama_adapter_training * t, const llama_toke
             ggml_graph_reset(t->result->get_gf());
             t->plan.abort_callback = abort_callback;
             t->plan.abort_callback_data = abort_data;
-            const auto status = ggml_graph_compute(t->result->get_gf(), &t->plan);
+            const auto status = ggml_graph_compute(gradients ? t->result->get_gf() : t->forward, &t->plan);
             if (status != GGML_STATUS_SUCCESS) throw training_failure(status == GGML_STATUS_ABORTED ? LLAMA_ADAPTER_TRAINING_FAILURE_CANCELLED :
             status == GGML_STATUS_ALLOC_FAILED ? LLAMA_ADAPTER_TRAINING_FAILURE_RESOURCE_EXHAUSTED : LLAMA_ADAPTER_TRAINING_FAILURE_INVALID,
             status == GGML_STATUS_ABORTED ? "training compute cancelled" : "training graph compute failed");
             value = *(const float *) t->loss->data;
         }
         if (!std::isfinite(value)) throw std::runtime_error("nonfinite training loss");
-        for (const auto & entry : t->gradients) {
+        if (gradients) for (const auto & entry : t->gradients) {
             const float * values = (const float *) entry.second->data;
             for (int64_t i = 0; i < ggml_nelements(entry.second); ++i) if (!std::isfinite(values[i])) throw std::runtime_error("nonfinite adapter gradient");
         }
@@ -440,7 +444,7 @@ bool llama_adapter_training_compute(llama_adapter_training * t, const llama_toke
         *loss = value;
         t->supervised = supervised;
         t->revision = t->adapter->training_revision;
-        t->valid = true;
+        t->valid = gradients;
         return true;
     } catch (const training_failure & e) {
         return failed(e.code, e.what());
@@ -449,6 +453,16 @@ bool llama_adapter_training_compute(llama_adapter_training * t, const llama_toke
     } catch (const std::exception & e) {
         return failed(LLAMA_ADAPTER_TRAINING_FAILURE_INVALID, e.what());
     }
+}
+
+bool llama_adapter_training_compute(llama_adapter_training * t, const llama_token * tokens, const llama_token * labels,
+        float * loss, ggml_abort_callback abort_callback, void * abort_data) {
+    return compute_loss(t, tokens, labels, loss, abort_callback, abort_data, true);
+}
+
+bool llama_adapter_training_evaluate(llama_adapter_training * t, const llama_token * tokens, const llama_token * labels,
+        float * loss, ggml_abort_callback abort_callback, void * abort_data) {
+    return compute_loss(t, tokens, labels, loss, abort_callback, abort_data, false);
 }
 
 size_t llama_adapter_training_gradient(const llama_adapter_training * t, const char * name, float * data, size_t capacity) {

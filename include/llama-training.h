@@ -84,6 +84,15 @@ extern "C" {
             const llama_token * tokens, const llama_token * labels, float * loss,
             ggml_abort_callback abort_callback, void * abort_data);
 
+    // Compute the same masked loss with forward nodes only; no adapter or optimizer state changes.
+    // Invalidates earlier gradients even on success. Evaluation cannot be accumulated by the optimizer.
+    // Checkpointed evaluation forwards one layer boundary at a time without store reads or writes; clear still runs.
+    // Uses the same conservative preflight and workspace allocation as training. Token validation and cancellation are unchanged.
+    LLAMA_API bool llama_adapter_training_evaluate(
+            struct llama_adapter_training * training,
+            const llama_token * tokens, const llama_token * labels, float * loss,
+            ggml_abort_callback abort_callback, void * abort_data);
+
     // Read the last successful gradient using the full adapter tensor name, including .lora_a or .lora_b.
     // Returns its element count, or zero if no matching tensor or current successful compute exists.
     // An optimizer step or checkpoint restore invalidates gradients computed against older parameter values.
